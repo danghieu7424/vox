@@ -7,14 +7,17 @@ pub mod series;
 pub mod speaker_registry;
 pub mod subtitles;
 
-pub use alignment::{align_subtitles, assign_speaker_to_sub, SpeakerTurn};
+pub use alignment::{align_subtitles, align_subtitles_with_embeddings, assign_speaker_to_sub, SpeakerTurn};
 pub use audio::{extract_audio_with_ffmpeg, load_media_audio, load_wav, AudioBuffer};
 pub use error::VoxError;
-pub use model::{ensure_model, VoxConfig, VoxModel, DEFAULT_MODEL_URL};
+pub use model::{
+    ensure_model, estimate_f0, SpeakerEmbeddingExtractor, VoxConfig, VoxModel,
+    DEFAULT_EMBEDDING_MODEL_URL, DEFAULT_MODEL_URL, DEFAULT_SEGMENTATION_MODEL_URL,
+};
 pub use progress::{ProgressCallback, ProgressInfo, ProgressStage};
 pub use series::{scan_series_directory, EpisodePair};
 pub use speaker_registry::{
-    compute_speaker_voiceprints, cosine_similarity, extract_voiceprint, SpeakerProfile, SpeakerRegistry,
+    cosine_similarity, SpeakerProfile, SpeakerRegistry,
 };
 pub use subtitles::{
     extract_character_name_from_annotation, format_seconds_to_srt_timestamp,
@@ -23,7 +26,6 @@ pub use subtitles::{
     SpeakerFormat, SubtitleFormat, SubtitleSegment,
 };
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Bộ máy chính điều phối toàn bộ quá trình Diarization & Phụ đề
@@ -36,17 +38,12 @@ impl VoxEngine {
         Self { config }
     }
 
-    /// Khởi tạo với cấu hình mặc định (model tại models/pyannote_segmentation.onnx, xuất ra thư mục output/)
+    /// Khởi tạo với cấu hình mặc định (mô hình tại models/campplus.onnx, xuất ra thư mục output/)
     pub fn default_engine() -> Self {
         Self::new(VoxConfig::default())
     }
 
-    /// Thực hiện trọn gói quy trình cho 1 tập đơn lẻ:
-    /// 1. Kiểm tra / Tải model ONNX nếu chưa có
-    /// 2. Trích xuất audio từ MP4 / Media sang 16kHz WAV mono
-    /// 3. Phân đoạn giọng nói (Diarization ONNX inference trên CPU)
-    /// 4. Đọc phụ đề VTT/SRT và khớp Speaker (gán nhãn người nói, bỏ qua chú thích 《...》)
-    /// 5. Xuất phụ đề mới ra thư mục output chỉ định
+    /// Thực hiện trọn gói quy trình cho 1 tập đơn lẻ
     pub fn process_video_and_subtitles<P1, P2, F>(
         &self,
         video_or_audio_path: P1,
@@ -68,7 +65,7 @@ impl VoxEngine {
     }
 
     /// Xử lý 1 tập phim với Sổ bộ nhân vật (SpeakerRegistry) dùng chung qua các tập.
-    /// Giúp nhân vật cũ giữ nguyên mã ID (ví dụ SPEAKER_01) và nhân vật mới được cấp mã mới.
+    /// Giúp nhân vật cũ giữ nguyên mã ID/tên và nhân vật mới được cấp mã mới.
     pub fn process_episode_with_registry<P1, P2, F>(
         &self,
         video_or_audio_path: P1,
@@ -86,7 +83,8 @@ impl VoxEngine {
         let episode_name = video_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("episode");
+            .unwrap_or("episode")
+            .trim_end_matches(".vox");
 
         let mut report = |info: ProgressInfo| {
             if let Some(cb) = progress_cb.as_mut() {
@@ -114,14 +112,14 @@ impl VoxEngine {
             ));
         }
 
-        // 2. Trích xuất Audio
+        // 2. Trích xuất Audio (Tự động ưu tiên file vocal-separated .vox.wav nếu có)
         report(ProgressInfo::new(
             ProgressStage::ExtractingAudio,
             0,
             1,
             "file",
             "...",
-            format!("Đang trích xuất audio từ: {}", video_path.display()),
+            format!("Đang nạp audio từ: {}", video_path.display()),
         ));
 
         let audio_buffer = load_media_audio(video_path)?;
@@ -141,69 +139,28 @@ impl VoxEngine {
         // 3. Đọc phụ đề VTT / SRT
         let (mut segments, format) = load_subtitles(sub_path)?;
 
-        // 4. Khởi tạo session & Inference ONNX trên CPU
-        let mut model = VoxModel::load(model_file, self.config.cpu_threads)?;
-        let mut infer_cb = |p: &ProgressInfo| report(p.clone());
-        let mut local_turns = model.run_diarization(
-            &audio_buffer.samples,
-            &self.config,
-            Some(&mut infer_cb),
-        )?;
+        // 4. Khởi tạo Deep Speaker Embedding Extractor trên CPU
+        report(ProgressInfo::new(
+            ProgressStage::Inference,
+            0,
+            segments.len(),
+            "cues",
+            "...",
+            format!("Đang khởi tạo mô hình trích xuất voiceprint CAM++ trên CPU..."),
+        ));
 
-        // 5. Trích xuất Voiceprints & Khớp với SpeakerRegistry toàn cục (Cross-Episode Matching)
-        let local_voiceprints = compute_speaker_voiceprints(
-            &audio_buffer.samples,
-            audio_buffer.sample_rate,
-            &local_turns,
-        );
+        let mut extractor = SpeakerEmbeddingExtractor::load(model_file, self.config.cpu_threads)?;
 
-        // Quét trước các thẻ chú thích `《Tên Nhân Vật》` gần lượt nói để thu thập gợi ý tên
-        let mut local_name_hints: HashMap<String, String> = HashMap::new();
-        for sub in &segments {
-            if sub.is_annotation {
-                if let Some(name) = extract_character_name_from_annotation(&sub.text) {
-                    let matched_local_spk = assign_speaker_to_sub(sub.start_sec, sub.end_sec, &local_turns);
-                    local_name_hints.entry(matched_local_spk).or_insert(name);
-                }
-            }
-        }
+        report(ProgressInfo::new(
+            ProgressStage::Inference,
+            segments.len(),
+            segments.len(),
+            "cues",
+            "0s",
+            format!("Trích xuất đặc trưng âm sắc cho {} câu phụ đề hoàn tất", segments.len()),
+        ));
 
-        // Ánh xạ từ Local Speaker (trong tập) sang Global Speaker (xuyên suốt bộ phim)
-        let mut local_to_global: HashMap<String, String> = HashMap::new();
-        for (local_spk, (vp, dur)) in &local_voiceprints {
-            let name_hint = local_name_hints.get(local_spk).map(|s| s.as_str());
-            let (global_id, is_new, sim) = registry.match_or_register(
-                vp,
-                *dur,
-                episode_name,
-                name_hint,
-            );
-
-            let status_msg = if is_new {
-                format!("Nhân vật MỚI: {} (gợi ý: {:?})", global_id, name_hint)
-            } else {
-                format!("Nhân vật CŨ: {} (độ khớp: {:.1}%)", global_id, sim * 100.0)
-            };
-            report(ProgressInfo::new(
-                ProgressStage::AligningSubtitles,
-                local_to_global.len() + 1,
-                local_voiceprints.len(),
-                "speakers",
-                "0s",
-                status_msg,
-            ));
-
-            local_to_global.insert(local_spk.clone(), global_id);
-        }
-
-        // Cập nhật lại speaker_id trong turns theo mã Global
-        for turn in local_turns.iter_mut() {
-            if let Some(global_id) = local_to_global.get(&turn.speaker_id) {
-                turn.speaker_id = global_id.clone();
-            }
-        }
-
-        // 6. Khớp phụ đề với các Speaker Turns (Bỏ qua các câu chú thích 《...》)
+        // 5. Khớp người nói và phụ đề với Sổ bộ nhân vật (SpeakerRegistry)
         report(ProgressInfo::new(
             ProgressStage::AligningSubtitles,
             0,
@@ -213,20 +170,13 @@ impl VoxEngine {
             format!("Đang gắn nhãn người nói cho {} câu phụ đề...", segments.len()),
         ));
 
-        let detected_names = align_subtitles(&mut segments, &local_turns);
-
-        // Gán display_name từ registry nếu phụ đề chưa có
-        for sub in segments.iter_mut() {
-            if !sub.is_annotation {
-                if sub.speaker_name.is_none() {
-                    if let Some(spk_id) = &sub.speaker {
-                        if let Some(profile) = registry.speakers.get(spk_id) {
-                            sub.speaker_name = profile.display_name.clone();
-                        }
-                    }
-                }
-            }
-        }
+        let detected_names = align_subtitles_with_embeddings(
+            &mut segments,
+            &audio_buffer,
+            &mut extractor,
+            registry,
+            episode_name,
+        )?;
 
         report(ProgressInfo::new(
             ProgressStage::AligningSubtitles,
@@ -235,13 +185,13 @@ impl VoxEngine {
             "cues",
             "0s",
             format!(
-                "Gắn nhãn thành công cho {} câu phụ đề (nhận diện {} tên nhân vật)",
+                "Gắn nhãn thành công cho {} câu phụ đề (nhận diện {} nhân vật)",
                 segments.len(),
                 detected_names.len()
             ),
         ));
 
-        // 7. Xuất ra thư mục output
+        // 6. Xuất ra thư mục output
         let output_dir = &self.config.output_dir;
         std::fs::create_dir_all(output_dir)?;
 
@@ -288,7 +238,7 @@ impl VoxEngine {
     }
 
     /// Xử lý trọn bộ cả thư mục phim gồm nhiều tập:
-    /// - Tự động quét và ghép cặp video + phụ đề từng tập
+    /// - Tự động quét và ghép cặp video/audio (.vox.wav / .mp4) + phụ đề từng tập
     /// - Quản lý nhân vật xuyên suốt các tập (nhân vật cũ giữ nguyên ID, nhân vật mới cấp ID mới)
     /// - Xuất phụ đề đã gắn nhãn cho từng tập vào output_dir
     /// - Lưu `speaker_registry.json` chứa danh sách hồ sơ toàn bộ nhân vật của phim

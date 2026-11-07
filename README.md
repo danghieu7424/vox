@@ -12,22 +12,26 @@ Mô hình được tối ưu hóa toàn diện cho **CPU** thông qua **ONNX Run
 
 ## 🌟 Tính Năng Nổi Bật
 
-- **CPU-Only Siêu Tốc:** Chạy thuần trên CPU bằng ONNX Runtime; video 2.4 phút (144 giây) xử lý xong trong **1.57 giây** trên CPU thông thường.
-- **Tự Động Tải Model Thông Minh:** Kiểm tra đường dẫn chỉ định:
+- **CPU-Only Siêu Tốc:** Chạy thuần trên CPU bằng ONNX Runtime; video 2.4 phút (144 giây) xử lý xong trong **1.5 - 3.0 giây** trên CPU thông thường.
+- **Deep Speaker Embedding CAM++ & Tự Động Tải Model:**
+  - Tích hợp mô hình trích xuất vân giọng cao cấp **CAM++ (192-dimensional embedding)** từ 3D-Speaker / Alibaba tối ưu riêng cho giọng nói tiếng Á / tiếng Trung.
+  - Tự động kiểm tra và tải model ONNX nếu chưa có trên đĩa theo đúng cú pháp:
   ```rust
-  let model = Path::new("models/pyannote_segmentation.onnx");
+  let model = Path::new("models/campplus.onnx");
   if !model.exists() { /* Tự động tải từ HuggingFace với thanh % tải */ }
   ```
+- **Tự Động Ưu Tiên File Tách Giọng (`<stem>.vox.wav`):**
+  - Khi xử lý phim có nhạc nền (BGM) to hoặc âm thanh hiệu ứng phức tạp, hệ thống tự động ưu tiên nạp file vocal track tách riêng (ví dụ `第001集.vox.wav`) nếu có trong cùng thư mục, loại bỏ hoàn toàn nhiễu BGM giúp độ chính xác đạt tối đa!
 - **Xử Lý Chú Thích Màn Hình Thông Minh:** 
   - Tự động phát hiện các câu phụ đề là thẻ tên nhân vật, chú thích, tiêu đề dạng `《...》`, `【...】`, `[...]`, `(...)` (ví dụ `《陆清安》`, `《小女儿-陆淼淼》`, `《系统》`).
   - **Không gắn nhãn người nói đè vào chú thích**, giữ nguyên vẹn nội dung gốc.
   - Tự động trích xuất tên nhân vật từ thẻ tên màn hình để liên kết với hồ sơ giọng nói.
 - **Quản Lý Nhân Vật Xuyên Suốt Phim Bộ Nhiều Tập (Cross-Episode Consistency):**
-  - Cung cấp **`SpeakerRegistry`**: Hệ thống trích xuất vân giọng (Acoustic Voiceprint Signature) và so khớp Cosine Similarity.
+  - Cung cấp **`SpeakerRegistry`**: Hệ thống trích xuất vector đặc trưng 192-d cùng cao độ Pitch (F0) và so khớp Cosine Similarity.
   - Khi xử lý chuỗi nhiều tập (Tập 1, Tập 2, Tập 3...):
-    - **Nhân vật cũ quay lại:** Được nhận diện tự động và **giữ nguyên mã ID** (ví dụ `SPEAKER_01` ở Tập 1 vẫn là `SPEAKER_01` ở Tập 2).
-    - **Nhân vật mới xuất hiện:** Hệ thống tự động phát hiện và cấp mã ID mới (`SPEAKER_02`, `SPEAKER_03`...).
-    - Xuất file **`speaker_registry.json`** lưu trữ toàn bộ danh sách nhân vật, thời lượng nói và các tập xuất hiện.
+    - **Nhân vật cũ quay lại:** Được nhận diện tự động và **giữ nguyên mã ID và tên** (ví dụ `[陆清安]`, `[系统]`, `[徐清莹]` ở Tập 1 vẫn giữ nguyên ở Tập 2).
+    - **Nhân vật mới xuất hiện:** Hệ thống tự động phát hiện và cấp mã ID mới (`SPEAKER_10: [陆正然]`, `SPEAKER_11: [何訇]`, `SPEAKER_12: [徐轩宇]`...).
+    - Xuất file **`speaker_registry.json`** lưu trữ toàn bộ danh sách nhân vật, vector vân giọng, thời lượng nói và các tập xuất hiện.
 - **Tự Động Quét & Ghép Cặp Thư Mục Phim:** Hàm `scan_series_directory` và `process_series` tự động ghép cặp file video và phụ đề tương ứng trong thư mục `input/`.
 - **Chuẩn Tiến Trình Tương Thích Hoàn Hảo với `cli_gui_form`:** Cung cấp struct `ProgressInfo` với bộ 5 tham số chuẩn:
   `(current, total, unit, duration, status)` khớp 1-1 với `TaskWidget` của crate `cli_gui_form` (dễ dàng gắn vào TUI Form hoặc render CLI).

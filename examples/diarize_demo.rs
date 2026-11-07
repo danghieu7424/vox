@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use vox::{
     process_diarization, ProgressInfo, SpeakerFormat, VoxConfig,
-    DEFAULT_MODEL_URL,
+    DEFAULT_EMBEDDING_MODEL_URL,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,18 +12,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("═════════════════════════════════════════════════════════════════════\n");
 
     // 1. Chỉ định đường dẫn đầu vào (2 file có thể ở 2 thư mục khác nhau)
+    // Tự động ưu tiên file vocal-separated .vox.wav nếu có trong cùng thư mục
     let video_path = PathBuf::from("input/第001集.mp4");
     let subtitle_path = PathBuf::from("input/第001集.zh.vtt");
     let output_dir = PathBuf::from("output");
 
     println!("📁 [Đầu vào]");
-    println!("   • Video:   {}", video_path.display());
-    println!("   • Phụ đề:  {}", subtitle_path.display());
+    println!("   • Video/Audio: {}", video_path.display());
+    println!("   • Phụ đề:      {}", subtitle_path.display());
     println!("   • Thư mục xuất: {}\n", output_dir.display());
 
     // 2. Chỉ định đường dẫn lưu và sử dụng model theo đúng yêu cầu:
     //    let model = Path::new("models/..."); model.exists()
-    let model = Path::new("models/pyannote_segmentation.onnx");
+    let model = Path::new("models/campplus.onnx");
     println!("🧠 [Mô hình ONNX]");
     println!("   • Đường dẫn: {}", model.display());
     if model.exists() {
@@ -36,12 +37,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Cấu hình Engine
     let mut config = VoxConfig::default();
     config.model_path = model.to_path_buf();
-    config.model_url = DEFAULT_MODEL_URL.to_string();
+    config.model_url = DEFAULT_EMBEDDING_MODEL_URL.to_string();
     config.output_dir = output_dir.clone();
-    config.speaker_format = SpeakerFormat::Prefix; // [SPEAKER_00]: Text
+    config.speaker_format = SpeakerFormat::NamedIfAvailable; // [陆清安]: Text hoặc [SPEAKER_00]: Text nếu chưa rõ tên
     config.cpu_threads = 4; // Tối ưu CPU 4 threads inference
-    config.onset_threshold = 0.5;
-    config.offset_threshold = 0.5;
 
     // 4. Hook tiến trình theo chuẩn TaskWidget của `cli_gui_form`
     // Tham khảo TaskWidget::new_progress(id, label, current, total, unit, duration, status, color)
@@ -49,8 +48,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
 
     let progress_callback = |p: &ProgressInfo| {
-        // Lấy bộ 5 tham số chuẩn TaskWidget của cli_gui_form:
-        // (current, total, unit, duration, status)
         let (current, total, unit, duration, status) = p.to_cli_gui_params();
 
         if last_stage != Some(p.stage) {
@@ -58,14 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_stage = Some(p.stage);
         }
 
-        // Vẽ thanh tiến trình phong cách Parallelogram/Line của cli_gui_form
         let bar_width: usize = 30;
         let filled_chars = ((p.percentage / 100.0) * bar_width as f32).round() as usize;
         let empty_chars = bar_width.saturating_sub(filled_chars);
         let filled_bar = "▰".repeat(filled_chars);
         let empty_bar = "▱".repeat(empty_chars);
 
-        // Hiển thị tiến trình trên 1 dòng chuẩn CLI / TUI Bridge
         print!(
             "\r  [{}{}] {:>5.1}% | {}/{} {} | {:>6} | {}",
             filled_bar, empty_bar, p.percentage, current, total, unit, duration, status
@@ -74,8 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::io::stdout().flush();
     };
 
+    // 5. Tiến hành chạy Diarization
     println!("⚡ Bắt đầu tiến trình xử lý Diarization...");
-    let output_file = process_diarization(
+    let result_path = process_diarization(
         &video_path,
         &subtitle_path,
         &output_dir,
@@ -83,15 +79,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(progress_callback),
     )?;
 
-    println!("\n\n🎉 Xử lý hoàn tất trong {:.2}s!", total_start.elapsed().as_secs_f32());
-    println!("📄 File kết quả đã xuất tại: {}\n", output_file.display());
+    println!(
+        "\n\n🎉 Xử lý hoàn tất trong {:.2}s!",
+        total_start.elapsed().as_secs_f32()
+    );
+    println!("📄 File kết quả đã xuất tại: {}\n", result_path.display());
 
-    // Hiển thị 5 dòng đầu tiên của file kết quả để nghiệm thu
-    if output_file.exists() {
-        println!("🔎 [Trích xuất 20 dòng đầu tiên của kết quả:]");
+    // Đọc thử 20 dòng đầu tiên của kết quả để kiểm tra
+    if result_path.exists() {
+        println!("🔎 [Trích xuất 25 dòng đầu tiên của kết quả:]");
         println!("─────────────────────────────────────────────────────────────────────");
-        let content = std::fs::read_to_string(&output_file)?;
-        for line in content.lines().take(20) {
+        let content = std::fs::read_to_string(&result_path)?;
+        for line in content.lines().take(25) {
             println!("{}", line);
         }
         println!("─────────────────────────────────────────────────────────────────────");
