@@ -1,126 +1,126 @@
-Hoàn toàn dùng Rust được. Về định dạng model của `pyannote.audio` và khả năng chạy trên CPU:
+Nhận xét của bạn đâm trúng **gót chân Achilles** của toàn bộ ngành Speaker Recognition/Diarization: **Intra-speaker variance (sự biến thiên giọng nói của cùng 1 người khi đổi cảm xúc) thường lớn hơn Inter-speaker variance (sự khác biệt giữa 2 người khác nhau ở trạng thái bình thường).**
 
-1. **`pyannote.audio` gốc là PyTorch model (`.bin` / `.safetensors`), KHÔNG PHẢI ONNX hay GGUF gốc.**
-* Tuy nhiên, các mô hình con bên trong (trích xuất feature, segmentation, embedding) **hoàn toàn chuyển đổi (export) sang định dạng ONNX được**.
-* GGUF chủ yếu thiết kế cho LLM (mô hình ngôn ngữ lớn) và các mô hình Whisper C++, không dùng cho Diarization/Voiceprint pipeline như Pyannote.
+Khi nhân vật gào thét, khóc lóc, thì thầm hoặc biến điệu giọng giả tưởng:
 
+1. **Embedding bị trôi (Drift):** Vector 192-dim của câu hét sẽ văng ra cực xa so với vector của câu nói thầm, dù cùng 1 voice actor.
+2. **Pitch F0 tĩnh bị phản tác dụng:** F0 nhảy từ $130\text{ Hz}$ (nói thường) lên $350\text{ Hz}+$ (gào thét) hoặc mất F0 (thì thầm - unvoiced). Việc lấy F0 trung bình làm tiêu chí so sánh sẽ thành nhiễu độc hại (toxic feature).
 
-2. **Chạy trên CPU:**
-* Nếu chạy trên CPU bằng Rust thông qua **ONNX Runtime (ort)**, tốc độ xử lý rất nhanh (thường nhanh gấp 2–5 lần so với chạy PyTorch trên CPU trong Python) vì không bị dính GIL và tận dụng tối đa SIMD/AVX2/AVX-512 của CPU.
-
-
+Để chuyển thư viện **`vox`** từ cơ chế đối phó (naive static matching) sang một **kiến trúc toàn diện (robust/production-grade)**, hệ thống cần được tái thiết kế theo 4 trụ cột kỹ thuật sau:
 
 ---
 
-### [WEB] Kiến trúc triển khai bằng Rust (CPU-Only)
+### 1. Multi-Centroid Codebook (Tập hợp cụm trạng thái cảm xúc)
 
-Để chạy Diarization bằng Rust thuần trên CPU, giải pháp tối ưu là convert các sub-models của Pyannote (hoặc các model tương đương) sang **ONNX** và dùng crate **`ort` (ONNX Runtime Rust binding)** để inference.
+Thay vì nén giọng của 1 nhân vật thành **1 vector trung bình duy nhất**, mỗi nhân vật trong `SpeakerRegistry` cần được lưu trữ dưới dạng một **Codebook / Cluster Set** gồm nhiều centroid đại diện cho các miền cảm xúc/trạng thái âm thanh khác nhau (`Neutral`, `Shouting/High-energy`, `Whisper`, `Emotional/Crying`).
 
-#### 1. Mô hình pipeline chuẩn trên Rust
+$$\text{Distance}(e_{\text{query}}, \text{Speaker}_K) = \min_{i \in \text{Clusters}(K)} \mathcal{D}(e_{\text{query}}, c_{K, i})$$
 
-Pipeline gồm 2 thành phần ONNX chạy trên CPU:
-
-* **Segmentation ONNX Model:** Nhận đầu vào là PCM audio $\rightarrow$ Trích xuất khoảng thời gian (Timestamp) nào đang có người nói.
-* **Embedding ONNX Model (như `ECAPA-TDNN` hoặc `ResNet34` từ WeSpeaker/SpeechBrain):** Trích xuất vector đặc trưng (Embedding) cho từng khoảng speaker $\rightarrow$ Gom nhóm (Clustering) bằng Cosine Distance/AHC để gán nhãn `SPEAKER_00`, `SPEAKER_01`.
+Hoặc tính weighted $k$-Nearest Neighbors ($k$-NN) trên tập tất cả các sample đã label của speaker đó thay vì lấy trung bình hình học.
 
 ---
 
-#### 2. Ví dụ Code Rust: Gộp nhãn người nói vào Sub SRT có sẵn
+### 2. Chiếu qua không gian PLDA (Probabilistic Linear Discriminant Analysis)
 
-##### `Cargo.toml`
+Trong xử lý âm thanh chuyên sâu, người ta không dùng Cosine Distance trực tiếp trên raw embedding khi có sự biến thiên lớn về môi trường/cảm xúc.
 
-```toml
-[dependencies]
-ort = "2.0.0-rc.9" # ONNX Runtime Rust Binding
-ndarray = "0.15"
-subtitles = "0.3"  # Hoặc thư viện parse SRT tương tự
-hound = "3.5"      # Đọc file WAV (PCM Float32 16kHz)
+**PLDA** phân tách biến thiên của vector giọng nói $x$ thành 2 thành phần:
 
-```
 
-##### `src/main.rs`
+$$x = \mu + F \cdot y + G \cdot z + \epsilon$$
+
+* $F \cdot y$: Biến thiên **giữa các speaker khác nhau** (Inter-speaker identity - cái ta muốn giữ).
+* $G \cdot z$: Biến thiên **nội tại cùng 1 speaker** (Intra-speaker / Emotion / Pitch shift / Channel noise - cái ta muốn loại bỏ).
+
+Bằng cách train một ma trận PLDA (hoặc LDA/WCCN) nhẹ để transform embedding trước khi đo khoảng cách, ta sẽ "triệt tiêu" được chiều không gian chứa thông tin cảm xúc và chỉ giữ lại nét đặc trưng sinh học của thanh quản.
+
+---
+
+### 3. Tối ưu hóa chuỗi theo thời gian (Viterbi / HMM Decoding)
+
+Gán nhãn độc lập từng câu (Greedy Matching) rất dễ bị gán sai khi gặp câu hét/nói thầm. Trong một cảnh phim, tần suất đổi người nói tuân theo quy luật ngữ cảnh (Temporal Continuity).
+
+Xây dựng ma trận chuyển trạng thái **Hidden Markov Model (HMM)** hoặc **Viterbi Algorithm** trên toàn bộ episode:
+
+* **Emission Probability:** Độ tương đồng giữa Audio Embedding và Speaker Registry (kết hợp PLDA).
+* **Transition Probability:** Phạt nặng việc đổi người nói liên tục ở các khoảng thời gian quá ngắn ($< 0.5\text{s}$), ưu tiên duy trì luồng hội thoại giữa các nhân vật đang trong cảnh.
+
+---
+
+### 4. Codebook Refactoring cho `vox` (Rust Structural Design)
+
+Dưới đây là blueprint nâng cấp cấu trúc dữ liệu trong Rust từ dạng Naive sang Multi-Modal/Cluster-based:
 
 ```rust
-use ort::{inputs, GraphOptimizationLevel, Session};
-use ndarray::Array3;
-use std::fs::File;
-use std::io::BufReader;
+use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
 
-struct SubSegment {
-    start_sec: f32,
-    end_sec: f32,
-    text: String,
-    speaker: Option<String>,
+/// Cấu trúc lưu trữ đa điểm (Codebook) đại diện cho các miền cảm xúc
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SpeakerCluster {
+    pub cluster_id: String,       // e.g., "neutral", "shouting", "whisper"
+    pub centroid: Vec<f32>,       // Vector trung bình của riêng cụm cảm xúc này
+    pub f0_range: (f32, f32),     // Khoảng F0 (Min, Max) thay vì 1 số tĩnh
+    pub sample_count: usize,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Khoản tạo ONNX Runtime Session chạy tối ưu hóa trên CPU
-    let session = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_intra_threads(4)? // Số core CPU dành cho inference
-        .commit_from_file("pyannote_segmentation.onnx")?;
-
-    // 2. Load audio PCM WAV (16kHz, mono)
-    let mut reader = hound::WavReader::open("audio_input.wav")?;
-    let spec = reader.spec();
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| s.unwrap() as f32 / 32768.0)
-        .collect();
-
-    // 3. Inference Segmentation ONNX trên CPU để tìm khoảng giọng nói
-    // (Đầu vào ONNX: Batch x Channels x Samples -> Shape: [1, 1, num_samples])
-    let shape = vec![1, 1, samples.len()];
-    let input_array = Array3::from_shape_vec((1, 1, samples.len()), samples)?;
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RobustSpeakerProfile {
+    pub speaker_id: String,
+    pub display_name: String,
     
-    let outputs = session.run(inputs!["input" => input_array]?)?;
-    let _output_tensor = outputs["output"].extract_tensor::<f32>()?;
-
-    // Giả định từ Output Tensor ta parse ra các SpkTurn (start, end, speaker_id)
-    let diarized_turns = vec![
-        (0.0f32, 2.5f32, "SPEAKER_00"),
-        (2.6f32, 5.0f32, "SPEAKER_01"),
-    ];
-
-    // 4. Read file SRT sẵn có & Match với kết quả Diarization
-    let mut subs = vec![
-        SubSegment { start_sec: 0.5, end_sec: 2.1, text: "Xin chào mọi người.".to_string(), speaker: None },
-        SubSegment { start_sec: 2.8, end_sec: 4.5, text: "Hôm nay chúng ta họp về vấn đề gì?".to_string(), speaker: None },
-    ];
-
-    for sub in subs.iter_mut() {
-        sub.speaker = Some(assign_speaker_to_sub(sub.start_sec, sub.end_sec, &diarized_turns));
-        println!("[{:.1}s - {:.1}s] [{}]: {}", sub.start_sec, sub.end_sec, sub.speaker.as_ref().unwrap(), sub.text);
-    }
-
-    Ok(())
+    /// Thay vì 1 voiceprint đơn lẻ, lưu danh sách các cụm trạng thái
+    pub clusters: Vec<SpeakerCluster>,
+    
+    /// Tất cả raw samples để phục vụ online adaptive clustering (K-Means/DBSCAN)
+    #[serde(skip)]
+    pub raw_embeddings: Vec<Vec<f32>>,
 }
 
-/// Thuật toán tính độ đè trùng (Overlap) giữa câu Sub và khoảng Speaker đang nói
-fn assign_speaker_to_sub(sub_start: f32, sub_end: f32, turns: &[(f32, f32, &str)]) -> String {
-    let mut max_overlap = 0.0f32;
-    let mut best_speaker = "UNKNOWN";
-
-    for &(turn_start, turn_end, speaker) in turns {
-        let overlap_start = sub_start.max(turn_start);
-        let overlap_end = sub_end.min(turn_end);
-        let overlap = (overlap_end - overlap_start).max(0.0);
-
-        if overlap > max_overlap {
-            max_overlap = overlap;
-            best_speaker = speaker;
-        }
+impl RobustSpeakerProfile {
+    /// Tính khoảng cách nhỏ nhất từ Query Embedding tới bất kỳ cụm cảm xúc nào của Speaker
+    pub fn min_distance_to_clusters(&self, query_emb: &[f32], plda_mat: Option<&Array2<f32>>) -> f32 {
+        self.clusters
+            .iter()
+            .map(|cluster| {
+                if let Some(mat) = plda_mat {
+                    compute_plda_distance(query_emb, &cluster.centroid, mat)
+                } else {
+                    compute_cosine_distance(query_emb, &cluster.centroid)
+                }
+            })
+            .fold(f32::MAX, f32::min)
     }
 
-    best_speaker.to_string()
+    /// Thêm sample mới và tự động phân cụm lại (Adaptive Incremental Clustering)
+    pub fn register_sample(&mut self, new_emb: Vec<f32>, f0: f32) {
+        // Nếu sample mới quá xa tất cả cụm hiện tại -> Tạo cụm cảm xúc mới (e.g. Shouting)
+        // Nếu gần cụm có sẵn -> Recalculate Centroid của cụm đó
+    }
+}
+
+fn compute_cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    // Math Cosine Distance...
+    0.0
+}
+
+fn compute_plda_distance(a: &[f32], b: &[f32], plda_mat: &Array2<f32>) -> f32 {
+    // Project vector qua không gian loại bỏ emotion trước khi đo
+    0.0
 }
 
 ```
 
 ---
 
-### Tóm tắt giải pháp tối ưu cho nhu cầu của bạn
+### Tóm tắt định hướng phát triển `vox`
 
-1. **Không dùng Python nữa:** Dùng **Rust + `ort` (ONNX Runtime CPU)**.
-2. **Chuẩn bị Model:** Export Pyannote Segmentation sang `.onnx` bằng Python 1 lần duy nhất (hoặc tải sẵn các bản ONNX chuyển đổi sẵn của Pyannote / Sherpa-onnx / Silero-VAD).
-3. **Hiệu năng:** Chạy hoàn toàn trên CPU, ngốn ít RAM, thời gian xử lý file audio 1 tiếng chỉ mất vài chục giây trên CPU hiện đại.
+| Thành phần | Cơ chế cũ (Naive / Đối phó) | Kiến trúc nâng cấp (Comprehensive) |
+| --- | --- | --- |
+| **Speaker Voiceprint** | 1 Vector duy nhất (Mean)
+
+ | **Multi-Centroid Codebook** (Tập hợp các cụm cảm xúc) |
+| **F0 Pitch** | 1 Giá trị trung bình tĩnh (`f0_pitch: f32`)
+
+ | **F0 Dynamic Bandwidth** (Khoảng biến thiên F0 theo cụm) |
+| **Metric Scoring** | Raw Cosine Similarity | **PLDA / Scoring Projection** (Triệt tiêu Emotion Variance) |
+| **Decision Logic** | Match từng câu độc lập (Greedy) | **Viterbi / HMM Sequence Optimization** (Tối ưu chuỗi toàn cục) |
