@@ -14,7 +14,7 @@ pub use model::{ensure_model, VoxConfig, VoxModel, DEFAULT_MODEL_URL};
 pub use progress::{ProgressCallback, ProgressInfo, ProgressStage};
 pub use series::{scan_series_directory, EpisodePair};
 pub use speaker_registry::{
-    compute_speaker_voiceprints, extract_voiceprint, SpeakerProfile, SpeakerRegistry,
+    compute_speaker_voiceprints, cosine_similarity, extract_voiceprint, SpeakerProfile, SpeakerRegistry,
 };
 pub use subtitles::{
     extract_character_name_from_annotation, format_seconds_to_srt_timestamp,
