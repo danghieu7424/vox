@@ -1,0 +1,24 @@
+[package]
+name = "vox"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dang Hieu <danghieu7424@gmail.com>"]
+description = "High-performance speaker diarization and subtitle alignment library in Rust for CPU"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ort = "2.0.0-rc.9"
+ndarray = "0.16"
+hound = "3.5"
+reqwest = { version = "0.12", features = ["blocking", "stream"] }
+thiserror = "2.0"
+cli_gui_form = { path = "cli_gui_form", optional = true }
+
+[dev-dependencies]
+cli_gui_form = { path = "cli_gui_form" }
+crossterm = "0.28"
+ratatui = "0.28"
+
+[features]
+default = []
+tui = ["dep:cli_gui_form"]

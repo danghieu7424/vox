@@ -1,0 +1,9 @@
+target/
+cli_gui_form/
+
+*.lock
+*.vtt
+*.mp3
+*.acc
+*.mp4
+*.wav
