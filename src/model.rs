@@ -8,17 +8,45 @@ use ort::session::Session;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
-pub const DEFAULT_MODEL_URL: &str =
+pub const DEFAULT_EMBEDDING_MODEL_URL: &str =
+    "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx";
+
+pub const DEFAULT_SEGMENTATION_MODEL_URL: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.int8.onnx";
+
+// Backward compatibility
+pub const DEFAULT_MODEL_URL: &str = DEFAULT_EMBEDDING_MODEL_URL;
+
+static GLOBAL_ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+
+pub fn get_or_init_environment() -> Result<&'static ort::environment::Environment, VoxError> {
+    if let Some(env) = GLOBAL_ORT_ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init()
+        .with_name("vox_inference")
+        .build()?;
+    let _ = GLOBAL_ORT_ENV.set(env);
+    Ok(GLOBAL_ORT_ENV.get().unwrap())
+}
 
 #[derive(Debug, Clone)]
 pub struct VoxConfig {
+    /// Đường dẫn file model Speaker Embedding (CAM++)
     pub model_path: PathBuf,
+    /// URL tải model Speaker Embedding nếu chưa có trên đĩa
     pub model_url: String,
+    /// Đường dẫn file model Segmentation (Pyannote)
+    pub segmentation_model_path: PathBuf,
+    pub segmentation_model_url: String,
+    /// Thư mục xuất phụ đề đầu ra
     pub output_dir: PathBuf,
+    /// Định dạng tiền tố người nói (mặc định NamedIfAvailable: [Tên]: text hoặc [SPEAKER_xx]: text)
     pub speaker_format: SpeakerFormat,
+    /// Số luồng CPU sử dụng
     pub cpu_threads: usize,
     pub onset_threshold: f32,
     pub offset_threshold: f32,
@@ -29,10 +57,12 @@ pub struct VoxConfig {
 impl Default for VoxConfig {
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("models/pyannote_segmentation.onnx"),
-            model_url: DEFAULT_MODEL_URL.to_string(),
+            model_path: PathBuf::from("models/campplus.onnx"),
+            model_url: DEFAULT_EMBEDDING_MODEL_URL.to_string(),
+            segmentation_model_path: PathBuf::from("models/pyannote_segmentation.onnx"),
+            segmentation_model_url: DEFAULT_SEGMENTATION_MODEL_URL.to_string(),
             output_dir: PathBuf::from("output"),
-            speaker_format: SpeakerFormat::Prefix,
+            speaker_format: SpeakerFormat::NamedIfAvailable,
             cpu_threads: 4,
             onset_threshold: 0.5,
             offset_threshold: 0.5,
@@ -43,7 +73,7 @@ impl Default for VoxConfig {
 }
 
 /// Đảm bảo model tồn tại ở đường dẫn chỉ định:
-/// `let model = Path::new("models/..."); if !model.exists() { ... }`
+/// `let model = Path::new("models/..."); if !model.exists() { ensure_model(...) }`
 pub fn ensure_model(
     model_path: &Path,
     model_url: &str,
@@ -79,7 +109,7 @@ pub fn ensure_model(
     }
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .build()?;
 
     let mut response = client
@@ -88,7 +118,7 @@ pub fn ensure_model(
         .error_for_status()
         .map_err(|e| VoxError::ModelDownloadFailed(format!("HTTP request failed: {}", e)))?;
 
-    let total_bytes = response.content_length().unwrap_or(1540506); // ~1.54MB default INT8
+    let total_bytes = response.content_length().unwrap_or(28_281_138);
 
     let temp_dest = model_path.with_extension("tmp");
     let mut file = File::create(&temp_dest)?;
@@ -105,24 +135,32 @@ pub fn ensure_model(
         downloaded += bytes_read as u64;
 
         if let Some(cb) = progress_cb.as_mut() {
-            let elapsed = start_time.elapsed().as_secs();
-            let duration_str = format!("{}s", elapsed);
-            let mb_down = downloaded as f32 / 1_048_576.0;
-            let mb_total = total_bytes as f32 / 1_048_576.0;
-            let percent = ((downloaded as f64 / total_bytes as f64) * 100.0).min(100.0) as usize;
+            let percentage = (downloaded as f32 / total_bytes as f32 * 100.0).min(100.0);
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let eta = if downloaded > 0 && percentage < 100.0 {
+                let speed = downloaded as f32 / elapsed;
+                let remaining_bytes = total_bytes.saturating_sub(downloaded) as f32;
+                format!("{:.0}s còn lại", remaining_bytes / speed)
+            } else {
+                format!("{:.0}s", elapsed)
+            };
+
             cb(&ProgressInfo::new(
                 ProgressStage::DownloadingModel,
-                percent,
-                100,
-                "%",
-                duration_str,
-                format!("Đã tải {:.2} / {:.2} MB", mb_down, mb_total),
+                downloaded as usize / 1024,
+                total_bytes as usize / 1024,
+                "KB",
+                eta,
+                format!(
+                    "Tải mô hình: {:.1} MB / {:.1} MB",
+                    downloaded as f32 / 1_048_576.0,
+                    total_bytes as f32 / 1_048_576.0
+                ),
             ));
         }
     }
 
     file.flush()?;
-    drop(file);
     std::fs::rename(&temp_dest, model_path)?;
 
     if let Some(cb) = progress_cb.as_mut() {
@@ -132,40 +170,215 @@ pub fn ensure_model(
             100,
             "%",
             format!("{:.1}s", start_time.elapsed().as_secs_f32()),
-            "Tải mô hình thành công!",
+            format!("Tải mô hình hoàn tất: {}", model_path.display()),
         ));
     }
 
     Ok(model_path.to_path_buf())
 }
 
-pub struct VoxModel {
+/// Trích xuất Deep Speaker Embedding 192-chiều bằng mô hình CAM++ ONNX
+pub struct SpeakerEmbeddingExtractor {
     session: Session,
+    cos_table: Vec<Vec<f32>>,
+    sin_table: Vec<Vec<f32>>,
+    filterbank: Vec<Vec<f32>>,
+    window: Vec<f32>,
+    frame_len: usize,
+    frame_shift: usize,
+    num_bins: usize,
+}
+
+impl SpeakerEmbeddingExtractor {
+    pub fn load<P: AsRef<Path>>(model_path: P, cpu_threads: usize) -> Result<Self, VoxError> {
+        let path = model_path.as_ref();
+        if !path.exists() {
+            return Err(VoxError::ModelNotFound(path.to_path_buf()));
+        }
+
+        let env = get_or_init_environment()?;
+        let session = Session::builder(env)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(cpu_threads)?
+            .commit_from_file(path)?;
+
+        let sample_rate = 16000;
+        let frame_len = (sample_rate as f32 * 0.025) as usize; // 400
+        let frame_shift = (sample_rate as f32 * 0.010) as usize; // 160
+        let num_bins = 80;
+
+        let min_freq = 20.0f32;
+        let max_freq = sample_rate as f32 / 2.0;
+        let min_mel = 2595.0 * (1.0 + min_freq / 700.0).log10();
+        let max_mel = 2595.0 * (1.0 + max_freq / 700.0).log10();
+
+        let fft_size = 512;
+        let num_spec = fft_size / 2 + 1; // 257
+        let mut filterbank = vec![vec![0.0f32; num_spec]; num_bins];
+
+        for i in 0..num_bins {
+            let m_low = min_mel + (max_mel - min_mel) * (i as f32 / (num_bins + 1) as f32);
+            let m_center = min_mel + (max_mel - min_mel) * ((i + 1) as f32 / (num_bins + 1) as f32);
+            let m_high = min_mel + (max_mel - min_mel) * ((i + 2) as f32 / (num_bins + 1) as f32);
+
+            let f_low = 700.0 * (10.0f32.powf(m_low / 2595.0) - 1.0);
+            let f_center = 700.0 * (10.0f32.powf(m_center / 2595.0) - 1.0);
+            let f_high = 700.0 * (10.0f32.powf(m_high / 2595.0) - 1.0);
+
+            let k_low = ((f_low / max_freq) * (fft_size as f32 / 2.0)).floor() as usize;
+            let k_center = ((f_center / max_freq) * (fft_size as f32 / 2.0)).round() as usize;
+            let k_high = ((f_high / max_freq) * (fft_size as f32 / 2.0)).ceil() as usize;
+
+            for k in k_low..k_center {
+                if k_center > k_low {
+                    filterbank[i][k] = (k - k_low) as f32 / (k_center - k_low) as f32;
+                }
+            }
+            for k in k_center..k_high.min(num_spec) {
+                if k_high > k_center {
+                    filterbank[i][k] = (k_high - k) as f32 / (k_high - k_center) as f32;
+                }
+            }
+        }
+
+        let mut cos_table = vec![vec![0.0f32; frame_len]; num_spec];
+        let mut sin_table = vec![vec![0.0f32; frame_len]; num_spec];
+        for k in 0..num_spec {
+            for n in 0..frame_len {
+                let angle = -2.0 * std::f32::consts::PI * (k * n) as f32 / fft_size as f32;
+                cos_table[k][n] = angle.cos();
+                sin_table[k][n] = angle.sin();
+            }
+        }
+
+        let mut window = vec![0.0f32; frame_len];
+        for i in 0..frame_len {
+            window[i] = 0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (frame_len - 1) as f32).cos();
+        }
+
+        Ok(Self {
+            session,
+            cos_table,
+            sin_table,
+            filterbank,
+            window,
+            frame_len,
+            frame_shift,
+            num_bins,
+        })
+    }
+
+    /// Trích xuất vector đặc trưng embedding 192 chiều (đã chuẩn hoá L2) từ đoạn audio
+    pub fn extract_embedding(&mut self, samples: &[f32]) -> Result<Option<Vec<f32>>, VoxError> {
+        if samples.len() < self.frame_len {
+            return Ok(None);
+        }
+
+        let num_frames = (samples.len() - self.frame_len) / self.frame_shift + 1;
+        if num_frames < 4 {
+            return Ok(None);
+        }
+
+        let mut fbank = Vec::with_capacity(num_frames * self.num_bins);
+        let num_spec = self.cos_table.len();
+
+        for f in 0..num_frames {
+            let start = f * self.frame_shift;
+            let frame = &samples[start..start + self.frame_len];
+
+            let mut spec = [0.0f32; 257];
+            for k in 0..num_spec {
+                let mut re = 0.0f32;
+                let mut im = 0.0f32;
+                let cos_row = &self.cos_table[k];
+                let sin_row = &self.sin_table[k];
+                for n in 0..self.frame_len {
+                    let val = frame[n] * self.window[n];
+                    re += val * cos_row[n];
+                    im += val * sin_row[n];
+                }
+                spec[k] = re * re + im * im;
+            }
+
+            for bin in 0..self.num_bins {
+                let mut energy = 0.0f32;
+                let fb_row = &self.filterbank[bin];
+                for k in 0..num_spec {
+                    energy += spec[k] * fb_row[k];
+                }
+                fbank.push((energy + 1e-6).ln());
+            }
+        }
+
+        let input_array = Array3::from_shape_vec((1, num_frames, self.num_bins), fbank)
+            .map_err(|e| VoxError::ShapeError(format!("Array3 error: {}", e)))?;
+        let tensor = ort::value::Tensor::from_array(input_array)?;
+
+        let outputs = self.session.run(ort::inputs!["x" => tensor])?;
+        let (_shape, data) = outputs["embedding"].try_extract_tensor::<f32>()?;
+
+        let mut emb = data.to_vec();
+        let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        for x in emb.iter_mut() {
+            *x /= norm;
+        }
+
+        Ok(Some(emb))
+    }
+}
+
+/// Ước tính cao độ cơ bản (F0 pitch in Hz) của đoạn audio bằng phương pháp Autocorrelation
+pub fn estimate_f0(samples: &[f32], sample_rate: u32) -> f32 {
+    if samples.len() < 512 {
+        return 0.0;
+    }
+
+    let frame_len = 1024.min(samples.len());
+    let center = samples.len() / 2;
+    let start = center.saturating_sub(frame_len / 2);
+    let frame = &samples[start..(start + frame_len).min(samples.len())];
+
+    let min_lag = (sample_rate / 500) as usize; // ~500Hz
+    let max_lag = (sample_rate / 70) as usize;  // ~70Hz
+    let mut best_corr = 0.0f32;
+    let mut best_lag = 0;
+
+    for lag in min_lag..max_lag.min(frame.len() / 2) {
+        let mut corr = 0.0f32;
+        let mut e1 = 0.0f32;
+        let mut e2 = 0.0f32;
+        for n in 0..(frame.len() - lag) {
+            corr += frame[n] * frame[n + lag];
+            e1 += frame[n] * frame[n];
+            e2 += frame[n + lag] * frame[n + lag];
+        }
+        let norm = (e1 * e2).sqrt().max(1e-12);
+        let ncorr = corr / norm;
+        if ncorr > best_corr && ncorr > 0.35 {
+            best_corr = ncorr;
+            best_lag = lag;
+        }
+    }
+
+    if best_lag > 0 {
+        sample_rate as f32 / best_lag as f32
+    } else {
+        0.0
+    }
+}
+
+/// Mô hình Pyannote Segmentation chạy inference trên CPU
+pub struct VoxModel {
+    pub session: Session,
     pub window_size: usize,
     pub window_shift: usize,
-    pub sample_rate: usize,
+    pub sample_rate: u32,
     pub num_frames_per_window: usize,
     pub receptive_field_shift_samples: f64,
     pub seconds_per_frame: f64,
 }
 
-use std::sync::OnceLock;
-
-static GLOBAL_ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
-
-pub fn get_or_init_environment() -> Result<&'static ort::environment::Environment, VoxError> {
-    if let Some(env) = GLOBAL_ORT_ENV.get() {
-        return Ok(env);
-    }
-    let env = ort::init()
-        .with_name("vox_inference")
-        .build()?;
-    let _ = GLOBAL_ORT_ENV.set(env);
-    Ok(GLOBAL_ORT_ENV.get().unwrap())
-}
-
 impl VoxModel {
-    /// Nạp mô hình ONNX Runtime được tối ưu hóa cho CPU
     pub fn load<P: AsRef<Path>>(model_path: P, cpu_threads: usize) -> Result<Self, VoxError> {
         let path = model_path.as_ref();
         if !path.exists() {
@@ -179,12 +392,12 @@ impl VoxModel {
             .with_intra_threads(cpu_threads)?
             .commit_from_file(path)?;
 
-        let window_size = 160_000; // 10.0 giây ở 16kHz
-        let window_shift = 32_000; // 2.0 giây bước nhảy (80% overlap)
+        let window_size = 160_000;
+        let window_shift = 32_000;
         let sample_rate = 16_000;
         let num_frames_per_window = 589;
-        let receptive_field_shift_samples = window_size as f64 / num_frames_per_window as f64; // ~271.64
-        let seconds_per_frame = 10.0 / num_frames_per_window as f64; // ~0.0169779
+        let receptive_field_shift_samples = window_size as f64 / num_frames_per_window as f64;
+        let seconds_per_frame = 10.0 / num_frames_per_window as f64;
 
         Ok(Self {
             session,
@@ -197,7 +410,6 @@ impl VoxModel {
         })
     }
 
-    /// Chạy Diarization inference trên toàn bộ audio buffer với thuật toán trượt cửa sổ (Sliding Window)
     pub fn run_diarization(
         &mut self,
         samples: &[f32],
@@ -211,7 +423,6 @@ impl VoxModel {
         let total_samples = samples.len();
         let total_audio_sec = total_samples as f32 / self.sample_rate as f32;
 
-        // Tính số lượng chunk
         let num_chunks = if total_samples <= self.window_size {
             1
         } else {
@@ -221,7 +432,6 @@ impl VoxModel {
 
         let start_time = Instant::now();
 
-        // Chuẩn bị mảng Hamming window
         let mut hamming = Vec::with_capacity(self.num_frames_per_window);
         for i in 0..self.num_frames_per_window {
             let w = 0.54
@@ -232,7 +442,6 @@ impl VoxModel {
             hamming.push(w as f32);
         }
 
-        // Ước lượng tổng số frame timeline
         let total_frames = ((total_samples as f64 / self.receptive_field_shift_samples).ceil()
             as usize)
             + self.num_frames_per_window
@@ -240,37 +449,28 @@ impl VoxModel {
 
         let mut timeline_probs = vec![[0.0f32; 3]; total_frames];
         let mut timeline_weights = vec![0.0f32; total_frames];
-
         let mut prev_chunk_probs: Option<Vec<[f32; 3]>> = None;
 
         for chunk_idx in 0..num_chunks {
             let start_sample = chunk_idx * self.window_shift;
             let end_sample = (start_sample + self.window_size).min(total_samples);
 
-            // Cắt hoặc pad cho đủ self.window_size
             let mut chunk_samples = vec![0.0f32; self.window_size];
             let copy_len = end_sample - start_sample;
             chunk_samples[..copy_len].copy_from_slice(&samples[start_sample..end_sample]);
 
-            // Chuẩn bị tensor (1, 1, 160000)
             let input_array = Array3::from_shape_vec((1, 1, self.window_size), chunk_samples)
                 .map_err(|e| VoxError::ShapeError(format!("Array3 error: {}", e)))?;
             let input_tensor = ort::value::Tensor::from_array(input_array)?;
 
-            let outputs = self
-                .session
-                .run(ort::inputs!["x" => input_tensor])?;
+            let outputs = self.session.run(ort::inputs!["x" => input_tensor])?;
+            let (_shape, data) = outputs["y"].try_extract_tensor::<f32>()?;
 
-            let (_shape, data) = outputs["y"]
-                .try_extract_tensor::<f32>()?;
-
-            // Parse 589 frames x 7 classes sang 589 frames x 3 speakers
             let mut current_chunk_probs = Vec::with_capacity(self.num_frames_per_window);
             for f in 0..self.num_frames_per_window {
                 let offset = f * 7;
                 let c_vals = &data[offset..offset + 7];
 
-                // Chuyển log-probabilities thành probabilities (softmax hoặc exp)
                 let mut max_val = c_vals[0];
                 for &v in c_vals.iter() {
                     if v > max_val {
@@ -289,21 +489,12 @@ impl VoxModel {
                     *v /= sum_safe;
                 }
 
-                // Powerset mapping to 3 speakers:
-                // Class 0: silence
-                // Class 1: speaker 0
-                // Class 2: speaker 1
-                // Class 3: speaker 2
-                // Class 4: speaker 0 + 1
-                // Class 5: speaker 0 + 2
-                // Class 6: speaker 1 + 2
                 let spk0 = exp_vals[1] + exp_vals[4] + exp_vals[5];
                 let spk1 = exp_vals[2] + exp_vals[4] + exp_vals[6];
                 let spk2 = exp_vals[3] + exp_vals[5] + exp_vals[6];
                 current_chunk_probs.push([spk0, spk1, spk2]);
             }
 
-            // Giải quyết hoán vị người nói (Speaker permutation alignment) với chunk trước đó trong vùng overlap
             if let Some(prev) = prev_chunk_probs {
                 let overlap_samples = self.window_size.saturating_sub(self.window_shift);
                 let overlap_frames = ((overlap_samples as f64
@@ -318,7 +509,6 @@ impl VoxModel {
                         &current_chunk_probs[..overlap_frames],
                     );
 
-                    // Áp dụng hoán vị lên current_chunk_probs
                     for frame_prob in current_chunk_probs.iter_mut() {
                         let original = *frame_prob;
                         frame_prob[0] = original[perm[0]];
@@ -328,7 +518,6 @@ impl VoxModel {
                 }
             }
 
-            // Tích luỹ lên timeline chung với trọng số Hamming
             let frame_start_timeline =
                 (start_sample as f64 / self.receptive_field_shift_samples).round() as usize;
 
@@ -345,7 +534,6 @@ impl VoxModel {
 
             prev_chunk_probs = Some(current_chunk_probs);
 
-            // Báo tiến trình cho từng chunk
             if let Some(cb) = progress_cb.as_mut() {
                 let current_chunk = chunk_idx + 1;
                 let current_sec = (end_sample as f32 / self.sample_rate as f32).min(total_audio_sec);
@@ -369,7 +557,6 @@ impl VoxModel {
             }
         }
 
-        // Chuẩn hóa timeline bằng tổng trọng số
         for i in 0..total_frames {
             let w = timeline_weights[i];
             if w > 1e-6 {
@@ -379,7 +566,6 @@ impl VoxModel {
             }
         }
 
-        // Trích xuất các lượt nói (Speaker Turns) từ timeline_probs
         let mut raw_turns = Vec::new();
         let actual_total_frames = (total_samples as f64 / self.receptive_field_shift_samples)
             .ceil() as usize;
@@ -416,24 +602,19 @@ impl VoxModel {
             }
         }
 
-        // Sắp xếp các turns theo thời gian bắt đầu
         raw_turns.sort_by(|a, b| a.start_sec.partial_cmp(&b.start_sec).unwrap());
-
-        // Hợp nhất các khoảng trống nhỏ giữa các turns của cùng 1 speaker
         let merged_turns = merge_consecutive_turns(raw_turns, config.min_duration_off);
 
         Ok(merged_turns)
     }
 }
 
-/// Tìm hoán vị tối ưu của 3 speaker channels để tương đồng nhất với chunk trước đó
 fn find_best_permutation(prev_overlap: &[[f32; 3]], curr_overlap: &[[f32; 3]]) -> [usize; 3] {
     let n = prev_overlap.len().min(curr_overlap.len());
     if n == 0 {
         return [0, 1, 2];
     }
 
-    // Tính ma trận tương quan giữa prev_speaker i và curr_speaker j
     let mut corr = [[0.0f32; 3]; 3];
     for t in 0..n {
         for i in 0..3 {
@@ -443,7 +624,6 @@ fn find_best_permutation(prev_overlap: &[[f32; 3]], curr_overlap: &[[f32; 3]]) -
         }
     }
 
-    // 6 hoán vị khả dĩ của 3 phần tử
     let permutations: [[usize; 3]; 6] = [
         [0, 1, 2],
         [0, 2, 1],
@@ -457,7 +637,6 @@ fn find_best_permutation(prev_overlap: &[[f32; 3]], curr_overlap: &[[f32; 3]]) -
     let mut best_perm = [0, 1, 2];
 
     for p in permutations {
-        // Điểm số: prev 0 khớp với curr p[0], prev 1 khớp với curr p[1], prev 2 khớp với curr p[2]
         let score = corr[0][p[0]] + corr[1][p[1]] + corr[2][p[2]];
         if score > best_score {
             best_score = score;
@@ -468,31 +647,24 @@ fn find_best_permutation(prev_overlap: &[[f32; 3]], curr_overlap: &[[f32; 3]]) -
     best_perm
 }
 
-/// Hợp nhất các turns liên tiếp của cùng 1 speaker nếu khoảng trống nhỏ hơn min_gap
-fn merge_consecutive_turns(mut turns: Vec<SpeakerTurn>, min_gap: f32) -> Vec<SpeakerTurn> {
-    if turns.len() <= 1 {
-        return turns;
+fn merge_consecutive_turns(turns: Vec<SpeakerTurn>, min_gap: f32) -> Vec<SpeakerTurn> {
+    if turns.is_empty() {
+        return Vec::new();
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut i = 0;
-        while i + 1 < turns.len() {
-            if turns[i].speaker_id == turns[i + 1].speaker_id
-                && turns[i + 1].start_sec >= turns[i].end_sec
-                && (turns[i + 1].start_sec - turns[i].end_sec) <= min_gap
-            {
-                turns[i].end_sec = turns[i + 1].end_sec;
-                turns.remove(i + 1);
-                changed = true;
-            } else {
-                i += 1;
+    let mut merged: Vec<SpeakerTurn> = Vec::new();
+
+    for turn in turns {
+        if let Some(last) = merged.last_mut() {
+            if last.speaker_id == turn.speaker_id && turn.start_sec - last.end_sec <= min_gap {
+                last.end_sec = turn.end_sec.max(last.end_sec);
+                continue;
             }
         }
+        merged.push(turn);
     }
 
-    turns
+    merged
 }
 
 #[cfg(test)]
@@ -500,22 +672,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_permutation_finder() {
-        let prev = vec![[0.9, 0.1, 0.0], [0.8, 0.2, 0.0]];
-        let curr_swapped = vec![[0.1, 0.9, 0.0], [0.2, 0.8, 0.0]]; // 0 và 1 bị đảo
-        let perm = find_best_permutation(&prev, &curr_swapped);
-        assert_eq!(perm, [1, 0, 2]);
+    fn test_merge_turns() {
+        let turns = vec![
+            SpeakerTurn::new(0.0, 1.0, "SPEAKER_00"),
+            SpeakerTurn::new(1.2, 2.5, "SPEAKER_00"),
+            SpeakerTurn::new(2.8, 4.0, "SPEAKER_01"),
+        ];
+
+        let merged = merge_consecutive_turns(turns, 0.5);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].speaker_id, "SPEAKER_00");
+        assert_eq!(merged[0].start_sec, 0.0);
+        assert_eq!(merged[0].end_sec, 2.5);
+        assert_eq!(merged[1].speaker_id, "SPEAKER_01");
     }
 
     #[test]
-    fn test_merge_turns() {
-        let turns = vec![
-            SpeakerTurn::new(1.0, 2.0, "SPEAKER_00"),
-            SpeakerTurn::new(2.2, 3.5, "SPEAKER_00"), // gap = 0.2s <= 0.5s -> merge!
-            SpeakerTurn::new(4.0, 5.0, "SPEAKER_01"),
-        ];
-        let merged = merge_consecutive_turns(turns, 0.5);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].end_sec, 3.5);
+    fn test_permutation_finder() {
+        let prev = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let curr_swapped = vec![[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+
+        let perm = find_best_permutation(&prev, &curr_swapped);
+        assert_eq!(perm, [1, 0, 2]);
     }
 }

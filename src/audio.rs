@@ -139,30 +139,55 @@ pub fn extract_audio_with_ffmpeg<P1: AsRef<Path>, P2: AsRef<Path>>(
 }
 
 /// Nạp audio từ file media (hỗ trợ .wav trực tiếp hoặc tự động trích xuất từ .mp4 / .mkv / v.v.)
+/// Tự động ưu tiên file vocal-separated `<stem>.vox.wav` nếu tồn tại trong cùng thư mục
 pub fn load_media_audio<P: AsRef<Path>>(media_path: P) -> Result<AudioBuffer, VoxError> {
     let path = media_path.as_ref();
-    if !path.exists() {
+
+    // Kiểm tra xem có file vocal track (.vox.wav) cùng thư mục không
+    let vox_wav_path = if let Some(parent) = path.parent() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let pure_stem = stem.trim_end_matches(".vox");
+            let candidate = parent.join(format!("{}.vox.wav", pure_stem));
+            if candidate.exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let actual_path = if let Some(v_path) = vox_wav_path {
+        v_path
+    } else {
+        path.to_path_buf()
+    };
+
+    if !actual_path.exists() {
         return Err(VoxError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Media file not found: {}", path.display()),
+            format!("Media file not found: {}", actual_path.display()),
         )));
     }
 
-    let is_wav = path
+    let is_wav = actual_path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("wav"))
         .unwrap_or(false);
 
     if is_wav {
-        load_wav(path)
+        load_wav(&actual_path)
     } else {
         // Tạo temp file WAV để trích xuất bằng FFmpeg
         let temp_dir = std::env::temp_dir();
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("temp");
+        let stem = actual_path.file_stem().and_then(|s| s.to_str()).unwrap_or("temp");
         let temp_wav: PathBuf = temp_dir.join(format!("vox_temp_{}_{}.wav", stem, std::process::id()));
 
-        extract_audio_with_ffmpeg(path, &temp_wav)?;
+        extract_audio_with_ffmpeg(&actual_path, &temp_wav)?;
         let audio_buffer = load_wav(&temp_wav);
         let _ = std::fs::remove_file(&temp_wav); // Dọn dẹp temp
         audio_buffer
