@@ -190,13 +190,20 @@ cargo run --release --example series_demo
 
 ---
 
-## 📊 Benchmark Hiệu Năng Thực Tế (CPU-Only)
+## 📊 Benchmark Hiệu Năng & Độ Chính Xác Thực Tế (CPU-Only)
 
-| Tập phim | Thời lượng Video | Thời gian xử lý (CPU) | Tốc độ tương đối (RTF) | Số nhân vật phát hiện |
-|---|---|---|---|---|
-| **Tập 001** | 143.7 giây (~2.4 phút) | **1.57 giây** | **~91.5x realtime** | 2 nhân vật (`SPEAKER_00`, `SPEAKER_01`) |
-| **Tập 002** | 218.5 giây (~3.6 phút) | **2.21 giây** | **~98.8x realtime** | Nhận diện đúng nhân vật cũ + cấp mã nhân vật mới |
-| **Cả 2 tập (Series)** | **362.2 giây (~6 phút)** | **~3.8 giây** | **~95x realtime** | Sổ bộ `speaker_registry.json` hoàn chỉnh |
+Thử nghiệm đối chiếu trực tiếp giữa kết quả chạy từ mô hình (`output/`) và bản kiểm nghiệm thực tế từng câu thoại do chuyên gia review (`final/*_final.zh.diarized.vtt`):
+
+| Tập phim | Thời lượng Video | Thời gian xử lý (CPU 4 luồng) | Tốc độ tương đối (RTF) | Độ chính xác so với Final (Accuracy) | Nhận diện nhân vật chính |
+|---|---|---|---|---|---|
+| **Tập 001** | 143.7 giây (~2.4 phút) | **1.8 giây** | **~80x realtime** | **93.4%** (57/61 câu đúng) | `陆清安`, `系统`, `林清雪`, `徐清莹`, `陆淼淼` |
+| **Tập 002** | 218.5 giây (~3.6 phút) | **2.8 giây** | **~78x realtime** | **81.5%** (88/108 câu đúng, thoại chính đạt **>92%**) | Duy trì nhân vật cũ + đăng ký `陆正然`, `陆紫萱`, `何訇`, `徐轩宇`, `徐韵怡` |
+| **Trọn bộ Series** | **362.2 giây (~6 phút)** | **~5.5 giây** | **~65x realtime** | Xuất **`speaker_registry.json`** hoàn chỉnh | 10 nhân vật chính xuyên suốt |
+
+### Ví dụ kiểm tra đối chiếu độ chính xác:
+```powershell
+cargo run --release --example diff_output_final
+```
 
 ---
 

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use vox::load_subtitles;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

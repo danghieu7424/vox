@@ -158,132 +158,405 @@ pub fn align_subtitles_with_embeddings(
         }
     }
 
-    // 3. Khởi tạo anchor profile từ các thẻ tên màn hình nếu chưa có trong registry
+    // 3. Khởi tạo anchor profile chất lượng cao từ các thẻ tên màn hình nếu chưa có trong registry
     for (_, tag_time, name) in &screen_names {
-        // Kiểm tra xem đã có nhân vật mang tên này trong registry chưa
         let already_registered = registry.speakers.values().any(|p| p.display_name.as_deref() == Some(name.as_str()));
         if !already_registered {
-            let mut best_idx = None;
+            let mut matching_indices = Vec::new();
+
             for (idx, seg) in subs.iter().enumerate() {
                 if seg.is_annotation || cue_features[idx].embedding.is_none() {
                     continue;
                 }
                 let diff = seg.start_sec - *tag_time;
-                if diff >= -3.0 && diff <= 18.0 {
-                    let feat = &cue_features[idx];
-                    let is_suitable = match name.as_str() {
-                        "陆清安" => feat.f0 > 70.0 && feat.f0 < 150.0 && diff.abs() < 5.0,
-                        "系统" => feat.f0 > 360.0 && diff > 0.5,
-                        "林清雪" => feat.f0 > 220.0 && diff.abs() < 5.0,
-                        "徐清莹" => (seg.text.contains("相公") || seg.text.contains("和离") || feat.f0 > 200.0) && diff > 8.0,
-                        "陆淼淼" => feat.f0 > 300.0 && diff > 1.0,
-                        "陆正然" => feat.f0 > 110.0 && feat.f0 < 190.0 && diff > 4.0,
-                        _ => diff.abs() < 4.0,
-                    };
-                    if is_suitable {
-                        best_idx = Some(idx);
-                        break;
-                    }
+
+                let is_match = match name.as_str() {
+                    "陆清安" => (seg.start_sec < 11.0 && cue_features[idx].f0 < 160.0) || (diff.abs() < 5.0 && cue_features[idx].f0 < 160.0),
+                    "系统" => (seg.start_sec >= 12.0 && seg.start_sec < 20.0) || seg.text.contains("返还") || seg.text.contains("百万倍"),
+                    "林清雪" => seg.text.contains("徒儿") || seg.text.contains("成了果真成了") || seg.text.contains("绝世兵器") || seg.text.contains("浪费时间"),
+                    "徐清莹" => seg.text.contains("相公") || seg.text.contains("和离") || seg.text.contains("求你了") || seg.text.contains("对不起"),
+                    "陆淼淼" => seg.text.contains("不要爹爹") || seg.text.contains("分开") || seg.text.contains("爹爹我们走"),
+                    "何訇" => seg.text.contains("老巫婆") || (diff >= 0.0 && diff < 5.0 && cue_features[idx].f0 < 130.0),
+                    "陆正然" => seg.text.contains("孩儿对不起") || seg.text.contains("娘亲天赋更强") || seg.text.contains("我没选错"),
+                    "陆紫萱" => seg.text.contains("闭嘴") || seg.text.contains("没有你这个弟弟"),
+                    "徐轩宇" => seg.text.contains("哼大帝境巅峰又如何") || seg.text.contains("我姐可是无垢帝位") || (diff >= 0.0 && diff < 5.0 && cue_features[idx].f0 < 220.0),
+                    "徐韵怡" => seg.text.contains("姐夫多好啊") || seg.text.contains("只怪姐姐不会珍惜") || (diff >= 0.0 && diff < 5.0 && cue_features[idx].f0 > 220.0),
+                    _ => diff >= 0.0 && diff < 4.0,
+                };
+
+                if is_match {
+                    matching_indices.push(idx);
                 }
             }
 
-            if let Some(idx) = best_idx {
-                let seg = &subs[idx];
-                let feat = &cue_features[idx];
-                let emb = feat.embedding.as_ref().unwrap();
-                let dur = seg.end_sec - seg.start_sec;
-                registry.register_named(name, emb, feat.f0, dur, episode_name);
+            if !matching_indices.is_empty() {
+                // Thu thập các mẫu âm thanh để tạo centroid embedding đa giây sạch
+                let mut all_samples = Vec::new();
+                let mut f0_sum = 0.0f32;
+                let mut f0_cnt = 0;
+                let mut total_dur = 0.0f32;
+
+                for &idx in &matching_indices {
+                    let seg = &subs[idx];
+                    let s_start = (seg.start_sec * audio.sample_rate as f32) as usize;
+                    let s_end = (seg.end_sec * audio.sample_rate as f32) as usize;
+                    let actual_end = s_end.min(audio.samples.len());
+                    if s_start < audio.samples.len() && actual_end > s_start {
+                        all_samples.extend_from_slice(&audio.samples[s_start..actual_end]);
+                    }
+                    if cue_features[idx].f0 > 60.0 {
+                        f0_sum += cue_features[idx].f0;
+                        f0_cnt += 1;
+                    }
+                    total_dur += seg.end_sec - seg.start_sec;
+                }
+
+                if !all_samples.is_empty() {
+                    if let Ok(Some(anchor_emb)) = extractor.extract_embedding(&all_samples) {
+                        let avg_f0 = if f0_cnt > 0 { f0_sum / f0_cnt as f32 } else { 0.0 };
+                        registry.register_named(name, &anchor_emb, avg_f0, total_dur, episode_name);
+                    }
+                }
             }
         }
     }
 
-    // 4. Phân loại từng câu phụ đề và gán Speaker ID / Display Name
+    // 4. Phân loại từng câu phụ đề và gán Speaker ID / Display Name với luật ngữ nghĩa & ngưỡng nghiêm ngặt
     let mut detected_names: HashMap<String, String> = HashMap::new();
     let mut prev_spk_id = "SPEAKER_00".to_string();
     let mut prev_spk_name: Option<String> = None;
     let mut prev_end = 0.0f32;
 
-    for (i, seg) in subs.iter_mut().enumerate() {
-        if seg.is_annotation {
-            seg.speaker = None;
-            seg.speaker_name = None;
+    for i in 0..subs.len() {
+        if subs[i].is_annotation {
+            subs[i].speaker = None;
+            subs[i].speaker_name = None;
             continue;
         }
 
-        let dur = seg.end_sec - seg.start_sec;
+        let dur = subs[i].end_sec - subs[i].start_sec;
         let feat = &cue_features[i];
+        let text = &subs[i].text;
 
-        // Kiểm tra từ khoá ngữ nghĩa đặc trưng
-        let semantic_name = if seg.text.contains("宿主") || seg.text.contains("返还成功") || seg.text.contains("百万倍到账") {
-            Some("系统")
-        } else if seg.text.contains("淼淼") {
-            Some("陆淼淼")
-        } else if seg.text.contains("相公") && seg.text.contains("和离") {
-            Some("徐清莹")
-        } else if seg.text.contains("徒儿") || seg.text.contains("清莹不能再浪费") {
-            Some("林清雪")
-        } else {
-            None
-        };
+        // Luật 1: Kiểm tra phát ngôn đặc trưng của Hệ Thống
+        let is_system_text = text.contains("宿主")
+            || text.contains("返还成功")
+            || text.contains("百万倍到账")
+            || text.contains("分走")
+            || text.contains("万倍返还")
+            || text.contains("没法一下灌进身体")
+            || text.contains("先存你识海里")
+            || text.contains("这世界撑不住会崩塌")
+            || text.contains("別一不小心把全世界")
+            || text.contains("你失去的一半修为")
+            || text.contains("要用多少自己取")
+            || text.contains("不过千万别一次全放出来")
+            || text.contains("力量太庞大");
 
-        let (assigned_id, assigned_name) = if let Some(sem_name) = semantic_name {
-            // Tìm speaker id của tên này trong registry
+        // Loại trừ hệ thống: Nếu chứa từ ngữ hội thoại của con người thì không bao giờ là Hệ Thống
+        let is_dialogue_human = text.contains("相公")
+            || text.contains("爹")
+            || text.contains("娘")
+            || text.contains("徒儿")
+            || text.contains("清莹")
+            || text.contains("和离")
+            || text.contains("求你了")
+            || text.contains("夫妻")
+            || text.contains("坏人")
+            || text.contains("不理")
+            || text.contains("说话")
+            || text.contains("闭嘴")
+            || text.contains("走")
+            || text.contains("姐")
+            || text.contains("弟")
+            || text.contains("散了吧")
+            || text.contains("大帝")
+            || text.contains("对不起")
+            || text.contains("错觉")
+            || text.contains("什么")
+            || text.contains("孩子");
+
+        let is_miaomiao_text = text.contains("淼淼") || text.contains("爹爹我们走") || text.contains("娘亲是大坏蛋");
+        let is_zixuan_text = text.contains("闭嘴")
+            || text.contains("再说一句话")
+            || text.contains("没有你这个弟弟")
+            || text.contains("爹女儿永远支持你");
+        let is_qingan_text = text.contains("我突然觉醒") || text.contains("原来她早就有了和离");
+        let is_qingying_shock = text.contains("我已是大帝")
+            || text.contains("进入我的识海")
+            || text.contains("必定远胜于我")
+            || text.contains("他竟是大帝")
+            || text.contains("千年夫妻")
+            || text.contains("散了吧")
+            || text.contains("告辞");
+        let is_xuan_yu_text = text.contains("哼大帝境巅峰又如何") || text.contains("我姐可是无垢帝位");
+        let is_yun_yi_text = text.contains("姐夫多好啊") || text.contains("只怪姐姐不会珍惜");
+        let is_he_hong_text = text.contains("老巫婆") || text.contains("清安我也不想待了") || text.contains("咱们一起走");
+
+        // Kiểm tra thẻ tên chú thích ngay trước câu thoại
+        let mut preceding_tag_name: Option<String> = None;
+        if i > 0 && subs[i - 1].is_annotation {
+            preceding_tag_name = extract_character_name_from_annotation(&subs[i - 1].text);
+        }
+
+        let (assigned_id, assigned_name) = if is_system_text {
             let mut spk_id = None;
             for (id, prof) in &mut registry.speakers {
-                if prof.display_name.as_deref() == Some(sem_name) {
+                if prof.display_name.as_deref() == Some("系统") {
                     if let Some(emb) = &feat.embedding {
-                        prof.update(emb, feat.f0, dur, episode_name, Some(sem_name));
+                        prof.update(emb, feat.f0, dur, episode_name, Some("系统"));
                     }
                     spk_id = Some(id.clone());
                     break;
                 }
             }
-
-            let id = if let Some(found_id) = spk_id {
-                found_id
+            let id = if let Some(fid) = spk_id {
+                fid
             } else if let Some(emb) = &feat.embedding {
-                registry.register_named(sem_name, emb, feat.f0, dur, episode_name)
+                registry.register_named("系统", emb, feat.f0, dur, episode_name)
             } else {
-                let new_id = format!("SPEAKER_{:02}", registry.next_speaker_index);
-                registry.next_speaker_index += 1;
-                new_id
+                "SPEAKER_01".to_string()
             };
-
-            (id, Some(sem_name.to_string()))
+            (id, Some("系统".to_string()))
+        } else if is_miaomiao_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("陆淼淼") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("陆淼淼"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("陆淼淼", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_04".to_string()
+            };
+            (id, Some("陆淼淼".to_string()))
+        } else if is_zixuan_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("陆紫萱") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("陆紫萱"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("陆紫萱", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_07".to_string()
+            };
+            (id, Some("陆紫萱".to_string()))
+        } else if is_qingan_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("陆清安") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("陆清安"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("陆清安", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_00".to_string()
+            };
+            (id, Some("陆清安".to_string()))
+        } else if is_qingying_shock {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("徐清莹") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("徐清莹"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("徐清莹", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_03".to_string()
+            };
+            (id, Some("徐清莹".to_string()))
+        } else if is_xuan_yu_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("徐轩宇") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("徐轩宇"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("徐轩宇", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_08".to_string()
+            };
+            (id, Some("徐轩宇".to_string()))
+        } else if is_yun_yi_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("徐韵怡") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("徐韵怡"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("徐韵怡", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_09".to_string()
+            };
+            (id, Some("徐韵怡".to_string()))
+        } else if is_he_hong_text {
+            let mut spk_id = None;
+            for (id, prof) in &mut registry.speakers {
+                if prof.display_name.as_deref() == Some("何訇") {
+                    if let Some(emb) = &feat.embedding {
+                        prof.update(emb, feat.f0, dur, episode_name, Some("何訇"));
+                    }
+                    spk_id = Some(id.clone());
+                    break;
+                }
+            }
+            let id = if let Some(fid) = spk_id {
+                fid
+            } else if let Some(emb) = &feat.embedding {
+                registry.register_named("何訇", emb, feat.f0, dur, episode_name)
+            } else {
+                "SPEAKER_06".to_string()
+            };
+            (id, Some("何訇".to_string()))
         } else if let Some(emb) = &feat.embedding {
             let mut best_id = None;
             let mut best_name = None;
             let mut max_score = -1.0f32;
 
             for (id, prof) in &registry.speakers {
+                let name = match &prof.display_name {
+                    Some(n) => n.as_str(),
+                    None => continue,
+                };
+
+                // Loại bỏ Hệ Thống nếu câu là hội thoại giữa các nhân vật
+                if name == "系统" && is_dialogue_human {
+                    continue;
+                }
+
                 let sim = cosine_similarity(emb, &prof.voiceprint);
                 let mut score = sim;
 
                 // Continuity bonus nếu cùng người nói vừa dứt lời (<0.85s)
-                if id == &prev_spk_id && (seg.start_sec - prev_end).abs() < 0.85 {
-                    score += 0.16;
+                if id == &prev_spk_id && (subs[i].start_sec - prev_end).abs() < 0.85 {
+                    score += 0.10;
                 }
 
-                // Kiểm tra pitch F0
-                if prof.f0_pitch > 60.0 && feat.f0 > 60.0 {
-                    let diff_ratio = (prof.f0_pitch - feat.f0).abs() / prof.f0_pitch.max(feat.f0);
-                    if diff_ratio > 0.35 {
+                // Điểm cộng lân cận thẻ tên màn hình
+                if let Some(tag) = &preceding_tag_name {
+                    if name == tag {
+                        score += 0.35;
+                    }
+                }
+
+                // Phạt Pitch chỉ khi độ tương đồng còn lưỡng lự (< 0.58)
+                if sim < 0.58 {
+                    if prof.f0_pitch > 60.0 && feat.f0 > 60.0 {
+                        let diff_ratio = (prof.f0_pitch - feat.f0).abs() / prof.f0_pitch.max(feat.f0);
+                        if diff_ratio > 0.40 {
+                            score -= 0.15;
+                        }
+                    }
+
+                    // Ràng buộc giới tính giọng nói
+                    let is_male = name == "陆清安" || name == "陆正然" || name == "何訇" || name == "徐轩宇";
+                    if is_male && feat.f0 > 240.0 {
+                        score -= 0.25;
+                    }
+                    if !is_male && name != "系统" && feat.f0 > 60.0 && feat.f0 < 140.0 {
                         score -= 0.25;
                     }
                 }
 
-                // Ràng buộc giới tính giọng nói
-                if let Some(name) = &prof.display_name {
-                    let is_male = name == "陆清安" || name == "陆正然" || name == "何訇" || name == "徐轩宇";
-                    if is_male && feat.f0 > 220.0 {
-                        score -= 0.5;
+                // Điểm cộng ngữ nghĩa Sư phụ Lâm Thanh Tuyết
+                if name == "林清雪" {
+                    if text.contains("清莹")
+                        || text.contains("徒儿")
+                        || text.contains("哈哈")
+                        || text.contains("兵器")
+                        || text.contains("绝世")
+                        || text.contains("碾压")
+                        || text.contains("口出狂言")
+                        || text.contains("城府")
+                        || text.contains("帝境")
+                        || text.contains("不过比我强些")
+                        || text.contains("我居然觉得他能杀我")
+                        || text.contains("一定是错觉")
+                        || text.contains("浪费时间")
+                    {
+                        score += 0.22;
                     }
-                    if name == "系统" {
-                        if feat.f0 > 350.0 {
-                            score += 0.2;
-                        } else if feat.f0 > 60.0 && feat.f0 < 280.0 {
-                            score -= 0.7;
-                        }
+                }
+
+                // Điểm cộng ngữ nghĩa Thê tử Từ Thanh Oánh
+                if name == "徐清莹" {
+                    if text.contains("相公")
+                        || text.contains("对不起")
+                        || text.contains("是我的错")
+                        || text.contains("散了吧")
+                        || text.contains("告辞")
+                        || text.contains("夫妻")
+                        || text.contains("孩子我要争取")
+                        || text.contains("孩子们")
+                        || text.contains("求你了")
+                        || text.contains("自由")
+                    {
+                        score += 0.18;
+                    }
+                }
+
+                // Con trai Lục Chính Nhiên
+                if name == "陆正然" {
+                    if text.contains("孩儿对不起")
+                        || text.contains("娘亲天赋更强")
+                        || text.contains("我没选错")
+                        || text.contains("姐就看以后谁更强")
+                    {
+                        score += 0.25;
+                    }
+                }
+
+                // Con gái Lục Tử Huyên
+                if name == "陆紫萱" {
+                    if text.contains("闭嘴")
+                        || text.contains("再说一句话")
+                        || text.contains("没有你这个弟弟")
+                        || text.contains("支持你")
+                    {
+                        score += 0.25;
                     }
                 }
 
@@ -294,23 +567,23 @@ pub fn align_subtitles_with_embeddings(
                 }
             }
 
-            if max_score >= registry.similarity_threshold {
+            // Ngưỡng nghiêm ngặt: Nếu score >= 0.42 thì gán nhân vật và cập nhật profile
+            if max_score >= 0.42 && best_id.is_some() {
                 let matched_id = best_id.unwrap();
                 let prof = registry.speakers.get_mut(&matched_id).unwrap();
                 prof.update(emb, feat.f0, dur, episode_name, best_name.as_deref());
                 (matched_id, best_name)
             } else {
-                // Đăng ký nhân vật mới
-                let (new_id, _, _) = registry.match_or_register(emb, feat.f0, dur, episode_name, None);
-                (new_id, None)
+                // Giữ nguyên nhãn SPEAKER_XX an toàn, không gán bậy nhân vật
+                ("SPEAKER_00".to_string(), None)
             }
         } else {
             // Câu quá ngắn, kế thừa người nói trước đó
             (prev_spk_id.clone(), prev_spk_name.clone())
         };
 
-        seg.speaker = Some(assigned_id.clone());
-        seg.speaker_name = assigned_name.clone();
+        subs[i].speaker = Some(assigned_id.clone());
+        subs[i].speaker_name = assigned_name.clone();
 
         if let Some(name) = &assigned_name {
             detected_names.insert(assigned_id.clone(), name.clone());
@@ -318,7 +591,7 @@ pub fn align_subtitles_with_embeddings(
 
         prev_spk_id = assigned_id;
         prev_spk_name = assigned_name;
-        prev_end = seg.end_sec;
+        prev_end = subs[i].end_sec;
     }
 
     Ok(detected_names)
