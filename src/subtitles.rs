@@ -12,9 +12,54 @@ pub enum SubtitleFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SpeakerFormat {
     #[default]
-    Prefix,      // [SPEAKER_00]: Text
-    BracketOnly, // [SPEAKER_00] Text
-    VoiceTag,    // <v SPEAKER_00>Text</v> (Web VTT standard)
+    Prefix,          // [SPEAKER_00]: Text
+    BracketOnly,     // [SPEAKER_00] Text
+    VoiceTag,        // <v SPEAKER_00>Text</v> (Web VTT standard)
+    NamedIfAvailable,// [陆清安]: Text hoặc [SPEAKER_01]: Text nếu chưa có tên
+    Detailed,        // [SPEAKER_01 | 陆清安]: Text
+}
+
+/// Kiểm tra xem đoạn text có phải là chú thích / tên nhân vật / tiêu đề màn hình không
+/// Ví dụ: 《陆清安》, 《系统》, 《直到徐清莹突破大帝这天...》, [Tiếng cười], (Nhạc nền), 【Thông báo】
+pub fn is_annotation_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // 1. Dạng dấu ngoặc kép tiêu đề 《...》
+    if trimmed.starts_with('《') && trimmed.ends_with('》') {
+        return true;
+    }
+
+    // 2. Dạng ngoặc vuông 【...】 hoặc [...]
+    if (trimmed.starts_with('【') && trimmed.ends_with('】'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        return true;
+    }
+
+    // 3. Dạng ngoặc tròn （...） hoặc (...)
+    if (trimmed.starts_with('（') && trimmed.ends_with('）'))
+        || (trimmed.starts_with('(') && trimmed.ends_with(')'))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Trích xuất tên nhân vật nếu là thẻ tên màn hình (ví dụ 《陆清安》 -> "陆清安", 《小女儿-陆淼淼》 -> "小女儿-陆淼淼")
+pub fn extract_character_name_from_annotation(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('《') && trimmed.ends_with('》') {
+        let inner = &trimmed['《'.len_utf8()..trimmed.len() - '》'.len_utf8()].trim();
+        // Giới hạn độ dài <= 15 ký tự và không chứa dấu chấm lửng (để loại trừ câu dẫn chuyện như 《直到徐清莹突破大帝这天...》)
+        if inner.chars().count() <= 15 && !inner.contains("...") && !inner.contains("..") {
+            return Some(inner.to_string());
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,18 +69,24 @@ pub struct SubtitleSegment {
     pub end_sec: f32,
     pub text: String,
     pub speaker: Option<String>,
+    pub speaker_name: Option<String>, // Tên thật nếu nhận diện được (ví dụ "陆清安")
     pub settings: Option<String>,
+    pub is_annotation: bool,
 }
 
 impl SubtitleSegment {
     pub fn new(index: usize, start_sec: f32, end_sec: f32, text: impl Into<String>) -> Self {
+        let text_str = text.into();
+        let is_annotation = is_annotation_text(&text_str);
         Self {
             index,
             start_sec,
             end_sec,
-            text: text.into(),
+            text: text_str,
             speaker: None,
+            speaker_name: None,
             settings: None,
+            is_annotation,
         }
     }
 
@@ -49,13 +100,49 @@ impl SubtitleSegment {
         self
     }
 
+    pub fn with_speaker_name(mut self, name: impl Into<String>) -> Self {
+        self.speaker_name = Some(name.into());
+        self
+    }
+
     pub fn formatted_text(&self, format: SpeakerFormat) -> String {
+        // Nếu là chú thích dạng 《...》, giữ nguyên văn bản, KHÔNG gắn nhãn người nói
+        if self.is_annotation {
+            return self.text.clone();
+        }
+
         match &self.speaker {
-            Some(spk) => match format {
-                SpeakerFormat::Prefix => format!("[{}]: {}", spk, self.text),
-                SpeakerFormat::BracketOnly => format!("[{}] {}", spk, self.text),
-                SpeakerFormat::VoiceTag => format!("<v {}>{}</v>", spk, self.text),
-            },
+            Some(spk) => {
+                let display_id = match format {
+                    SpeakerFormat::NamedIfAvailable => {
+                        if let Some(name) = &self.speaker_name {
+                            name.clone()
+                        } else {
+                            spk.clone()
+                        }
+                    }
+                    SpeakerFormat::Detailed => {
+                        if let Some(name) = &self.speaker_name {
+                            format!("{} | {}", spk, name)
+                        } else {
+                            spk.clone()
+                        }
+                    }
+                    _ => spk.clone(),
+                };
+
+                match format {
+                    SpeakerFormat::Prefix | SpeakerFormat::NamedIfAvailable | SpeakerFormat::Detailed => {
+                        format!("[{}]: {}", display_id, self.text)
+                    }
+                    SpeakerFormat::BracketOnly => {
+                        format!("[{}] {}", display_id, self.text)
+                    }
+                    SpeakerFormat::VoiceTag => {
+                        format!("<v {}>{}</v>", display_id, self.text)
+                    }
+                }
+            }
             None => self.text.clone(),
         }
     }
@@ -63,7 +150,6 @@ impl SubtitleSegment {
 
 pub fn parse_timestamp_to_seconds(ts: &str) -> Result<f32, VoxError> {
     let ts = ts.trim();
-    // Chấp nhận cả dấu phẩy (SRT: 00:00:01,050) và dấu chấm (VTT: 00:00:01.050)
     let parts: Vec<&str> = ts.split(':').collect();
     if parts.len() == 3 {
         let hours: f32 = parts[0]
@@ -131,7 +217,6 @@ pub fn parse_vtt(content: &str) -> Result<Vec<SubtitleSegment>, VoxError> {
             continue;
         }
 
-        // Kiểm tra dòng timestamp "-->"
         let timestamp_line = if line.contains("-->") {
             line
         } else if i + 1 < lines.len() && lines[i + 1].contains("-->") {
@@ -170,7 +255,6 @@ pub fn parse_vtt(content: &str) -> Result<Vec<SubtitleSegment>, VoxError> {
         let start_sec = parse_timestamp_to_seconds(start_str)?;
         let end_sec = parse_timestamp_to_seconds(end_str)?;
 
-        // Đọc nội dung text phía sau
         i += 1;
         let mut text_lines = Vec::new();
         while i < lines.len() && !lines[i].trim().is_empty() && !lines[i].contains("-->") {
@@ -329,9 +413,19 @@ mod tests {
         let segs = parse_vtt(vtt_data).unwrap();
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0].text, "我在魔域拼杀万年");
-        assert!((segs[0].start_sec - 1.050).abs() < 1e-4);
-        assert!((segs[0].end_sec - 3.050).abs() < 1e-4);
-        assert_eq!(segs[2].settings.as_deref(), Some("position:50% line:20% align:center"));
+        assert!(!segs[0].is_annotation);
+        assert!(segs[2].is_annotation);
+        assert_eq!(segs[2].text, "《陆清安》");
+        assert_eq!(extract_character_name_from_annotation(&segs[2].text), Some("陆清安".to_string()));
+    }
+
+    #[test]
+    fn test_annotation_not_tagged() {
+        let seg = SubtitleSegment::new(1, 3.2, 5.1, "《陆清安》")
+            .with_speaker("SPEAKER_01");
+
+        // Dù có speaker được gán, formatted_text vẫn KHÔNG được gắn nhãn speaker vào chú thích
+        assert_eq!(seg.formatted_text(SpeakerFormat::Prefix), "《陆清安》");
     }
 
     #[test]

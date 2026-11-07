@@ -1,4 +1,5 @@
-use crate::subtitles::SubtitleSegment;
+use crate::subtitles::{extract_character_name_from_annotation, SubtitleSegment};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerTurn {
@@ -67,8 +68,7 @@ pub fn assign_speaker_to_sub(sub_start: f32, sub_end: f32, turns: &[SpeakerTurn]
         return spk;
     }
 
-    // Nếu không overlap trực tiếp (ví dụ subtitle xuất hiện sớm hơn hoặc trễ hơn chút ít),
-    // tìm turn gần nhất trong khoảng dung sai 1.0 giây
+    // Nếu không overlap trực tiếp, tìm turn gần nhất trong khoảng dung sai 1.0 giây
     let mut min_distance = f32::MAX;
     let mut nearest_speaker = None;
 
@@ -101,11 +101,40 @@ pub fn assign_speaker_to_sub(sub_start: f32, sub_end: f32, turns: &[SpeakerTurn]
 }
 
 /// Khớp danh sách câu phụ đề với các lượt nói (Speaker Turns)
-pub fn align_subtitles(subs: &mut [SubtitleSegment], turns: &[SpeakerTurn]) {
+/// - Bỏ qua các câu là chú thích (như `《陆清安》`, `《系统》`) để giữ nguyên văn bản gốc
+/// - Tự động phát hiện tên nhân vật từ các thẻ chú thích `《Tên Nhân Vật》` xuất hiện gần lượt nói
+pub fn align_subtitles(subs: &mut [SubtitleSegment], turns: &[SpeakerTurn]) -> HashMap<String, String> {
+    let mut speaker_name_hints: HashMap<String, String> = HashMap::new();
+
+    // 1. Quét tìm các thẻ tên màn hình `《Tên》` để gán vào speaker đang xuất hiện tại thời điểm đó
+    for sub in subs.iter() {
+        if sub.is_annotation {
+            if let Some(name) = extract_character_name_from_annotation(&sub.text) {
+                // Tìm speaker đang nói trong khoảng thời gian của thẻ tên này (+/- 2 giây)
+                let matched_spk = assign_speaker_to_sub(sub.start_sec, sub.end_sec, turns);
+                if !speaker_name_hints.contains_key(&matched_spk) {
+                    speaker_name_hints.insert(matched_spk, name);
+                }
+            }
+        }
+    }
+
+    // 2. Gán người nói cho các câu lời thoại thực tế
     for sub in subs.iter_mut() {
+        if sub.is_annotation {
+            // Chú thích thì không gán nhãn người nói
+            sub.speaker = None;
+            continue;
+        }
+
         let speaker = assign_speaker_to_sub(sub.start_sec, sub.end_sec, turns);
+        if let Some(name) = speaker_name_hints.get(&speaker) {
+            sub.speaker_name = Some(name.clone());
+        }
         sub.speaker = Some(speaker);
     }
+
+    speaker_name_hints
 }
 
 #[cfg(test)]
@@ -119,12 +148,29 @@ mod tests {
             SpeakerTurn::new(2.6, 5.0, "SPEAKER_01"),
         ];
 
-        // Sub từ 0.5 đến 2.1 đè trùng hoàn toàn vào SPEAKER_00
         let spk1 = assign_speaker_to_sub(0.5, 2.1, &turns);
         assert_eq!(spk1, "SPEAKER_00");
 
-        // Sub từ 2.8 đến 4.5 đè trùng hoàn toàn vào SPEAKER_01
         let spk2 = assign_speaker_to_sub(2.8, 4.5, &turns);
         assert_eq!(spk2, "SPEAKER_01");
+    }
+
+    #[test]
+    fn test_align_subtitles_skips_annotations() {
+        let mut subs = vec![
+            SubtitleSegment::new(1, 0.5, 2.0, "Chào mọi người"),
+            SubtitleSegment::new(2, 2.1, 2.5, "《Tiêu đề màn hình》"),
+            SubtitleSegment::new(3, 2.6, 4.0, "Tôi là ai?"),
+        ];
+        let turns = vec![
+            SpeakerTurn::new(0.0, 2.5, "SPEAKER_00"),
+            SpeakerTurn::new(2.6, 5.0, "SPEAKER_01"),
+        ];
+
+        align_subtitles(&mut subs, &turns);
+
+        assert_eq!(subs[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(subs[1].speaker, None); // Chú thích không có speaker
+        assert_eq!(subs[2].speaker.as_deref(), Some("SPEAKER_01"));
     }
 }

@@ -32,6 +32,9 @@ pub enum VoxError {
 
     #[error("Invalid shape or dimensions in inference: {0}")]
     ShapeError(String),
+
+    #[error("Invalid data or serialization error: {0}")]
+    InvalidData(String),
 }
 
 impl<T> From<ort::Error<T>> for VoxError {

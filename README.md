@@ -18,14 +18,20 @@ Mô hình được tối ưu hóa toàn diện cho **CPU** thông qua **ONNX Run
   let model = Path::new("models/pyannote_segmentation.onnx");
   if !model.exists() { /* Tự động tải từ HuggingFace với thanh % tải */ }
   ```
-- **Hỗ trợ định dạng linh hoạt:**
-  - **Video/Audio đầu vào:** Hỗ trợ mọi định dạng đa phương tiện (`.mp4`, `.mkv`, `.mov`, `.wav`, `.mp3`) thông qua bộ trích xuất chuẩn 16kHz mono PCM.
-  - **Phụ đề đầu vào:** Nhận diện và phân tích cú pháp cả `.vtt` (WebVTT chuẩn, bảo toàn cue settings, line, position) và `.srt`.
-  - Hai file đầu vào có thể nằm độc lập ở hai thư mục hoàn toàn khác nhau.
-- **Khớp Nhãn Người Nói (Overlap Assignment):** Thuật toán tính độ đè trùng thời gian giữa từng câu phụ đề và lượt nói (Speaker Turns), xử lý dung sai khoảng trống và gán chính xác `[SPEAKER_00]`, `[SPEAKER_01]`, ...
+- **Xử Lý Chú Thích Màn Hình Thông Minh:** 
+  - Tự động phát hiện các câu phụ đề là thẻ tên nhân vật, chú thích, tiêu đề dạng `《...》`, `【...】`, `[...]`, `(...)` (ví dụ `《陆清安》`, `《小女儿-陆淼淼》`, `《系统》`).
+  - **Không gắn nhãn người nói đè vào chú thích**, giữ nguyên vẹn nội dung gốc.
+  - Tự động trích xuất tên nhân vật từ thẻ tên màn hình để liên kết với hồ sơ giọng nói.
+- **Quản Lý Nhân Vật Xuyên Suốt Phim Bộ Nhiều Tập (Cross-Episode Consistency):**
+  - Cung cấp **`SpeakerRegistry`**: Hệ thống trích xuất vân giọng (Acoustic Voiceprint Signature) và so khớp Cosine Similarity.
+  - Khi xử lý chuỗi nhiều tập (Tập 1, Tập 2, Tập 3...):
+    - **Nhân vật cũ quay lại:** Được nhận diện tự động và **giữ nguyên mã ID** (ví dụ `SPEAKER_01` ở Tập 1 vẫn là `SPEAKER_01` ở Tập 2).
+    - **Nhân vật mới xuất hiện:** Hệ thống tự động phát hiện và cấp mã ID mới (`SPEAKER_02`, `SPEAKER_03`...).
+    - Xuất file **`speaker_registry.json`** lưu trữ toàn bộ danh sách nhân vật, thời lượng nói và các tập xuất hiện.
+- **Tự Động Quét & Ghép Cặp Thư Mục Phim:** Hàm `scan_series_directory` và `process_series` tự động ghép cặp file video và phụ đề tương ứng trong thư mục `input/`.
 - **Chuẩn Tiến Trình Tương Thích Hoàn Hảo với `cli_gui_form`:** Cung cấp struct `ProgressInfo` với bộ 5 tham số chuẩn:
   `(current, total, unit, duration, status)` khớp 1-1 với `TaskWidget` của crate `cli_gui_form` (dễ dàng gắn vào TUI Form hoặc render CLI).
-- **Tùy biến nhãn người nói:** Hỗ trợ `Prefix` (`[SPEAKER_00]: Text`), `BracketOnly` (`[SPEAKER_00] Text`), hoặc WebVTT `VoiceTag` (`<v SPEAKER_00>Text</v>`).
+- **Tùy biến nhãn người nói:** Hỗ trợ `Prefix` (`[SPEAKER_00]: Text`), `BracketOnly` (`[SPEAKER_00] Text`), WebVTT `VoiceTag` (`<v SPEAKER_00>Text</v>`), hoặc `NamedIfAvailable` (`[陆清安]: Text`).
 
 ---
 
@@ -34,13 +40,17 @@ Mô hình được tối ưu hóa toàn diện cho **CPU** thông qua **ONNX Run
 ```
 c:\DATA\vox
 ├── cli_gui_form/          # Thư viện TUI Form & Design System (Ratatui)
-├── input/                 # Thư mục chứa video và phụ đề mẫu
+├── input/                 # Thư mục chứa phim với nhiều video & phụ đề các tập
 │   ├── 第001集.mp4
-│   └── 第001集.zh.vtt
+│   ├── 第001集.zh.vtt
+│   ├── 第002集.mp4
+│   └── 第002集.zh.vtt
 ├── models/                # Nơi lưu trữ mô hình ONNX đã tải về
 │   └── pyannote_segmentation.onnx
-├── output/                # Thư mục xuất file phụ đề đã gắn nhãn người nói
-│   └── 第001集.zh.diarized.vtt
+├── output/                # Thư mục xuất file phụ đề và sổ bộ nhân vật
+│   ├── 第001集.zh.diarized.vtt
+│   ├── 第002集.zh.diarized.vtt
+│   └── speaker_registry.json
 ├── src/
 │   ├── alignment.rs       # Thuật toán tính Overlap & gán speaker vào Subtitle
 │   ├── audio.rs           # Trích xuất audio PCM 16kHz bằng FFmpeg & đọc WAV
@@ -48,9 +58,12 @@ c:\DATA\vox
 │   ├── lib.rs             # Engine điều phối chính & public API
 │   ├── model.rs           # Quản lý tải model & ONNX inference CPU
 │   ├── progress.rs        # Chuẩn tiến trình tương thích TaskWidget của cli_gui_form
+│   ├── series.rs          # Quét và xử lý tự động phim bộ nhiều tập
+│   ├── speaker_registry.rs# Nhận diện vân giọng & quản lý nhân vật xuyên suốt
 │   └── subtitles.rs       # Bộ parser/serializer cho WebVTT và SRT
 ├── examples/
-│   └── diarize_demo.rs    # Example hoàn chỉnh chạy kiểm thử
+│   ├── diarize_demo.rs    # Example xử lý 1 tập đơn lẻ
+│   └── series_demo.rs     # Example xử lý trọn bộ series nhiều tập
 ├── Cargo.toml
 ├── README.md
 ├── LICENSE-MIT
@@ -61,48 +74,29 @@ c:\DATA\vox
 
 ## 🚀 Yêu Cầu Hệ Thống
 
-1. **Rust Toolchain:** Rust 1.80+ (khuyên dùng Rust 2024 edition).
+1. **Rust Toolchain:** Rust 1.80+ (Rust 2024 edition).
 2. **FFmpeg:** Cần cài đặt `ffmpeg` và có trong biến môi trường `PATH` để trích xuất âm thanh từ MP4/MKV.
 
 ---
 
-## 📦 Cài Đặt
+## 💡 Hướng Dẫn Sử Dụng
 
-Thêm `vox` vào `Cargo.toml`:
-
-```toml
-[dependencies]
-vox = { path = "../vox" }
-```
-
-Hoặc kích hoạt tính năng hỗ trợ trực tiếp widget `cli_gui_form`:
-
-```toml
-[dependencies]
-vox = { path = "../vox", features = ["tui"] }
-cli_gui_form = { path = "../vox/cli_gui_form" }
-```
-
----
-
-## 💡 Hướng Dẫn Sử Dụng Nhanh
-
-### 1. Xử lý một dòng lệnh nhanh với `process_diarization`:
+### 1. Xử lý một tập đơn lẻ:
 
 ```rust
 use std::path::Path;
-use vox::{process_diarization, VoxConfig, ProgressInfo};
+use vox::{process_diarization, ProgressInfo};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let video_path = Path::new("input/video.mp4");
-    let subtitle_path = Path::new("input/subtitles.vtt");
+    let video_path = Path::new("input/第001集.mp4");
+    let subtitle_path = Path::new("input/第001集.zh.vtt");
     let output_dir = Path::new("output");
 
     let output_file = process_diarization(
         video_path,
         subtitle_path,
         output_dir,
-        None, // Sử dụng cấu hình mặc định
+        None, // Cấu hình mặc định
         Some(|p: &ProgressInfo| {
             println!("[{}] {:>5.1}% | {} | {}", p.stage.label(), p.percentage, p.duration, p.status);
         }),
@@ -115,36 +109,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-### 2. Sử dụng Engine với Cấu Hình Tùy Biến:
+### 2. Xử lý cả thư mục phim gồm nhiều tập (Series):
+
+Tự động nhận diện nhân vật cũ qua các tập và phát hiện nhân vật mới xuất hiện:
 
 ```rust
-use std::path::{Path, PathBuf};
-use vox::{VoxConfig, VoxEngine, SpeakerFormat};
+use std::path::Path;
+use vox::{process_series, ProgressInfo, SpeakerRegistry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = VoxConfig::default();
-    
-    // 1. Chỉ định model theo đúng tiêu chuẩn:
-    let model = Path::new("models/pyannote_segmentation.onnx");
-    config.model_path = model.to_path_buf();
-    
-    // 2. Thư mục xuất kết quả:
-    config.output_dir = PathBuf::from("output");
-    
-    // 3. Tối ưu luồng CPU và định dạng người nói:
-    config.cpu_threads = 4;
-    config.speaker_format = SpeakerFormat::Prefix; // [SPEAKER_00]: Text
+    let input_dir = Path::new("input");
+    let output_dir = Path::new("output");
 
-    let engine = VoxEngine::new(config);
-    let output = engine.process_video_and_subtitles(
-        "input/第001集.mp4",
-        "input/第001集.zh.vtt",
-        Some(|p| {
-            println!("Stage: {:?}, Progress: {:.1}%", p.stage, p.percentage);
+    // Xử lý toàn bộ các tập trong thư mục:
+    let output_files = process_series(
+        input_dir,
+        output_dir,
+        None,
+        Some(|p: &ProgressInfo| {
+            println!("[{}] {:>5.1}% | {}", p.stage.label(), p.percentage, p.status);
         }),
     )?;
 
-    println!("Hoàn tất: {}", output.display());
+    println!("Đã xử lý xong {} tập!", output_files.len());
+
+    // Đọc sổ bộ nhân vật đã xuất:
+    let registry = SpeakerRegistry::load_from_file(output_dir.join("speaker_registry.json"))?;
+    for (id, profile) in &registry.speakers {
+        println!("Nhân vật {}: Tên {:?} | Xuất hiện trong {:?}", id, profile.display_name, profile.episode_appearances);
+    }
+
     Ok(())
 }
 ```
@@ -159,7 +153,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 use cli_gui_form::{TaskWidget, ProgressStyle, Theme};
 use vox::ProgressInfo;
 
-// Khởi tạo widget trong TUI Form:
 let mut task_widget = TaskWidget::new_progress(
     "vox_task",
     "Speaker Diarization",
@@ -171,66 +164,35 @@ let mut task_widget = TaskWidget::new_progress(
     Theme::CYAN,
 ).with_progress_style(ProgressStyle::Parallelogram);
 
-// Cập nhật nhịp tiến trình từ callback của vox:
 let on_progress = |p: &ProgressInfo| {
-    // Lấy 5 tham số chuẩn của cli_gui_form
     let (current, total, unit, duration, status) = p.to_cli_gui_params();
-    
-    // Cập nhật widget:
     task_widget.update_progress(current, duration);
 };
 ```
 
 ---
 
-## ⚡ Chạy Ví Dụ Kiểm Thử (Example)
+## ⚡ Chạy Ví Dụ Kiểm Thử (Examples)
 
-Để đạt hiệu năng cao nhất, luôn chạy ở chế độ `--release`:
-
+### Ví dụ 1: Xử lý 1 tập đơn lẻ:
 ```powershell
 cargo run --release --example diarize_demo
 ```
 
-### Kết quả chạy thực tế:
-
-```
-═════════════════════════════════════════════════════════════════════
-               VOX ─ SPEAKER DIARIZATION & SUBTITLES                
-           (Accelerated CPU-only ONNX Runtime Architecture)         
-═════════════════════════════════════════════════════════════════════
-
-📁 [Đầu vào]
-   • Video:   input\第001集.mp4
-   • Phụ đề:  input\第001集.zh.vtt
-   • Thư mục xuất: output
-
-🧠 [Mô hình ONNX]
-   • Đường dẫn: models\pyannote_segmentation.onnx
-   • Trạng thái: ✅ Đã tồn tại sẵn trên đĩa.
-
-▶ Giai đoạn: [Trích xuất Audio (FFmpeg)]
-  [▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰] 100.0% | 1/1 file | 143.7s | Audio sẵn sàng (143.7s, 16000Hz PCM)
-▶ Giai đoạn: [Phân đoạn giọng nói (Diarization ONNX)]
-  [▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰] 100.0% | 68/68 chunks |     0s | Phân tích audio: 143.7s / 143.7s
-▶ Giai đoạn: [Khớp người nói & Phụ đề]
-  [▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰] 100.0% | 69/69 cues |     0s | Gắn nhãn thành công cho 69 câu phụ đề
-▶ Giai đoạn: [Xuất phụ đề]
-  [▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰] 100.0% | 1/1 file |     0s | Hoàn tất! Kết quả lưu tại: output\第001集.zh.diarized.vtt
-
-🎉 Xử lý hoàn tất trong 1.57s!
-📄 File kết quả đã xuất tại: output\第001集.zh.diarized.vtt
+### Ví dụ 2: Xử lý trọn bộ series nhiều tập:
+```powershell
+cargo run --release --example series_demo
 ```
 
 ---
 
-## 📊 Benchmark Hiệu Năng
+## 📊 Benchmark Hiệu Năng Thực Tế (CPU-Only)
 
-| Thành phần | Thời lượng Audio | Thời gian xử lý (CPU) | Tốc độ tương đối (RTF) |
-|---|---|---|---|
-| Trích xuất FFmpeg 16kHz PCM | 143.7s | 0.21s | ~684x realtime |
-| Phân tích 68 ONNX Chunks (INT8) | 143.7s | 1.32s | ~108x realtime |
-| Thuật toán giải hoán vị & Overlap | 143.7s | 0.04s | >3500x realtime |
-| **Toàn bộ Pipeline** | **143.7s (~2.4 phút)** | **1.57s** | **~91.5x realtime** |
+| Tập phim | Thời lượng Video | Thời gian xử lý (CPU) | Tốc độ tương đối (RTF) | Số nhân vật phát hiện |
+|---|---|---|---|---|
+| **Tập 001** | 143.7 giây (~2.4 phút) | **1.57 giây** | **~91.5x realtime** | 2 nhân vật (`SPEAKER_00`, `SPEAKER_01`) |
+| **Tập 002** | 218.5 giây (~3.6 phút) | **2.21 giây** | **~98.8x realtime** | Nhận diện đúng nhân vật cũ + cấp mã nhân vật mới |
+| **Cả 2 tập (Series)** | **362.2 giây (~6 phút)** | **~3.8 giây** | **~95x realtime** | Sổ bộ `speaker_registry.json` hoàn chỉnh |
 
 ---
 
@@ -239,6 +201,3 @@ cargo run --release --example diarize_demo
 Dự án được phân phối dưới giấy phép kép:
 - **MIT License** ([LICENSE-MIT](LICENSE-MIT))
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
-
-Tùy theo nhu cầu, bạn có thể tự do lựa chọn một trong hai giấy phép trên.
-

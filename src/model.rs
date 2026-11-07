@@ -149,6 +149,21 @@ pub struct VoxModel {
     pub seconds_per_frame: f64,
 }
 
+use std::sync::OnceLock;
+
+static GLOBAL_ORT_ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+
+pub fn get_or_init_environment() -> Result<&'static ort::environment::Environment, VoxError> {
+    if let Some(env) = GLOBAL_ORT_ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init()
+        .with_name("vox_inference")
+        .build()?;
+    let _ = GLOBAL_ORT_ENV.set(env);
+    Ok(GLOBAL_ORT_ENV.get().unwrap())
+}
+
 impl VoxModel {
     /// Nạp mô hình ONNX Runtime được tối ưu hóa cho CPU
     pub fn load<P: AsRef<Path>>(model_path: P, cpu_threads: usize) -> Result<Self, VoxError> {
@@ -157,11 +172,9 @@ impl VoxModel {
             return Err(VoxError::ModelNotFound(path.to_path_buf()));
         }
 
-        let env = ort::init()
-            .with_name("vox_inference")
-            .build()?;
+        let env = get_or_init_environment()?;
 
-        let session = Session::builder(&env)?
+        let session = Session::builder(env)?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(cpu_threads)?
             .commit_from_file(path)?;
